@@ -1,0 +1,101 @@
+# Token-protected APT mirror. The host Caddy serves the files and asks
+# repo-auth (UNIX socket, no network) whether a request may pass.
+#
+#   repo-auth   long-running, `docker compose up -d`
+#   repo-sync   one-shot, `docker compose run --rm repo-sync` from a systemd timer
+#   repo-admin  one-shot, `docker compose run --rm -T repo-admin <args>`
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-file: "10"
+    max-size: "1M"
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging: *default-logging
+
+networks:
+  sync:
+    driver: bridge
+    # Only repo-sync is attached: it downloads from the upstream repositories.
+    enable_ipv6: true
+    driver_opts:
+      com.docker.network.bridge.name: br-aptrepo
+    ipam:
+      driver: default
+      config:
+        - subnet: "${V4_PREFIX:-172.30.0}.0/24"
+        - subnet: "${V6_PREFIX:-fd00:d0c:30}::/64"
+
+services:
+  repo-auth:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/repo-auth.Dockerfile
+    image: apt-repo/repo-auth
+    restart: unless-stopped
+    network_mode: none
+    # The socket gets the process group, so the reverse proxy group is the
+    # primary group here (e.g. `getent group caddy`).
+    user: "${REPO_UID:?REPO_UID must be set in .env}:${SOCKET_GID:?SOCKET_GID must be set in .env}"
+    pids_limit: 64
+    mem_limit: 128m
+    environment:
+      REPO_AUTH_SOCKET: /run/repo-auth/auth.sock
+      REPO_AUTH_EXPORT: /data/export/clients.json
+      REPO_AUTH_REALM: "${REPO_AUTH_REALM:-APT repository}"
+    volumes:
+      - "${SOCKET_DIR:-/run/repo-auth}:/run/repo-auth"
+      - "${DATA_DIR:?DATA_DIR must be set in .env}/export:/data/export:ro"
+    healthcheck:
+      test: ["CMD", "python", "-m", "repo_auth.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  repo-admin:
+    <<: *hardening
+    profiles: [tools]
+    image: apt-repo/repo-auth
+    network_mode: none
+    user: "${REPO_UID}:${REPO_UID}"
+    entrypoint: ["python", "-m", "repo_auth.admin"]
+    environment:
+      REPO_ADMIN_DB: /data/db/repo.sqlite3
+      REPO_AUTH_EXPORT: /data/export/clients.json
+    volumes:
+      - "${DATA_DIR}/db:/data/db"
+      - "${DATA_DIR}/export:/data/export"
+
+  repo-sync:
+    <<: *hardening
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: docker/aptly.Dockerfile
+    image: apt-repo/aptly
+    networks: [sync]
+    user: "${SYNC_UID:-10200}:${SYNC_UID:-10200}"
+    pids_limit: 256
+    mem_limit: 1g
+    environment:
+      REPO_SYNC_CONFIG: /etc/repo-sync/mirrors.json
+      REPO_SYNC_ROOT: /var/lib/aptly
+      REPO_SYNC_SIGNING_KEY: /run/secrets/signing_key
+    secrets: [signing_key]
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    volumes:
+      - "${DATA_DIR}/aptly:/var/lib/aptly"
+      - "./config/mirrors.json:/etc/repo-sync/mirrors.json:ro"
+      - "./config/keys:/etc/repo-sync/keys:ro"
+
+secrets:
+  signing_key:
+    # Armored secret key, owner SYNC_UID, mode 0400 (bind-mounted as is).
+    file: "${SIGNING_KEY_FILE:?SIGNING_KEY_FILE must be set in .env}"

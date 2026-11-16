@@ -1,0 +1,16 @@
+name: Compose validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml with .env.ci (all profiles)
+        run: docker compose --env-file .env.ci --profile tools config -q

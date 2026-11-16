@@ -1,0 +1,23 @@
+# Site block for the host Caddy (tabs, `caddy fmt`). Paths: SOCKET_DIR and
+# DATA_DIR from .env. Public: catalogue from its own root (site/), never the
+# repository root. Everything else: forward_auth, then file_server without
+# `browse`.
+repo.example.org {
+	@public path / /index.html /status.json /key.asc
+	handle @public {
+		root * /srv/apt-repo/aptly/site
+		file_server
+	}
+	handle {
+		forward_auth unix//run/repo-auth/auth.sock {
+			uri /auth
+			copy_headers X-Repo-Client X-Repo-Account
+			transport http {
+				max_conns_per_host 32
+			}
+		}
+		root * /srv/apt-repo/aptly/public
+		file_server
+	}
+	header -Server
+}

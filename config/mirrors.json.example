@@ -1,0 +1,22 @@
+{
+  "gpg_key": "0123456789ABCDEF0123456789ABCDEF01234567",
+  "origin": "repo.example.org",
+  "label": "repo.example.org",
+  "keep_snapshots": 3,
+  "stale_warning_hours": 48,
+  "stale_critical_hours": 168,
+  "site_title": "APT mirrors",
+  "base_url": "https://repo.example.org",
+  "mirrors": [
+    {
+      "name": "caddy",
+      "title": "Caddy",
+      "url": "https://dl.cloudsmith.io/public/caddy/stable/deb/debian",
+      "distribution": "any-version",
+      "components": ["main"],
+      "architectures": ["amd64"],
+      "key_file": "/etc/repo-sync/keys/caddy.asc",
+      "prefix": "caddy"
+    }
+  ]
+}

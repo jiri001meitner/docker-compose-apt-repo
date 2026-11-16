@@ -1,0 +1,16 @@
+name: End-to-end (Caddy forward_auth)
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: repo-auth + repo-admin behind Caddy, request matrix
+        run: tests/e2e/run.sh
