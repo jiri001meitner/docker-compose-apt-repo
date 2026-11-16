@@ -1,6 +1,7 @@
 # aptly + repo-sync. Ubuntu 26.04 (aptly 1.6); the tag floats over point
-# releases and the image is rebuilt by `up`. `ubuntu:latest` still points to
-# 24.04 with aptly 1.5.
+# releases. `ubuntu:latest` still points to 24.04 with aptly 1.5. The service
+# is in the `tools` profile, so rebuild it explicitly:
+#   docker compose --profile tools build --pull
 FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive \

@@ -28,7 +28,7 @@ class Mirror:
     title: str
     url: str
     distribution: str
-    components: tuple[str, ...]
+    component: str
     architectures: tuple[str, ...]
     key_file: str
     prefix: str
@@ -38,7 +38,7 @@ class Mirror:
     def mirror_hash(self) -> str:
         """Changes when the aptly mirror must be recreated."""
         material = json.dumps(
-            [self.url, self.distribution, self.components, self.architectures, self.filter, self.filter_with_deps]
+            [self.url, self.distribution, self.component, self.architectures, self.filter, self.filter_with_deps]
         )
         return hashlib.sha256(material.encode()).hexdigest()[:16]
 
@@ -94,7 +94,7 @@ def _mirror(raw: Any, index: int) -> Mirror:
         "title",
         "url",
         "distribution",
-        "components",
+        "component",
         "architectures",
         "key_file",
         "prefix",
@@ -123,7 +123,9 @@ def _mirror(raw: Any, index: int) -> Mirror:
         title=_str(raw, "title", ctx),
         url=url,
         distribution=_str(raw, "distribution", ctx, DIST_RE),
-        components=_str_list(raw, "components", ctx, DIST_RE),
+        # One component per mirror: aptly merges several into one snapshot,
+        # and every upstream here (Caddy, PPAs) has only `main`.
+        component=_str(raw, "component", ctx, DIST_RE),
         architectures=_str_list(raw, "architectures", ctx, ARCH_RE),
         key_file=key_file,
         prefix=prefix,
@@ -158,6 +160,13 @@ def parse_config(data: str) -> Config:
     _req(len(names) == len(set(names)), "mirror names must be unique")
     published = [(m.prefix, m.distribution) for m in mirrors]
     _req(len(published) == len(set(published)), "prefix + distribution must be unique")
+    # A prefix nested in another (ppa vs ppa/x) would put one repository's
+    # tree inside another's, and an access scope for the outer one would
+    # silently cover the inner one.
+    prefixes = sorted({m.prefix for m in mirrors})
+    for outer in prefixes:
+        for inner in prefixes:
+            _req(not inner.startswith(outer + "/"), f"prefix {inner!r} is nested in {outer!r}")
     warn = _int(raw, "stale_warning_hours", 48, 1)
     crit = _int(raw, "stale_critical_hours", 168, 1)
     _req(crit >= warn, "stale_critical_hours must be >= stale_warning_hours")

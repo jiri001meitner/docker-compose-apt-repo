@@ -14,11 +14,13 @@ import argparse
 import contextlib
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from types import FrameType
 
 from .aptly import Aptly, AptlySettings
 from .catalog import render_index, render_status, report
@@ -54,12 +56,16 @@ def signing_keyring(key_file: str | None) -> Iterator[None]:
         return
     with tempfile.TemporaryDirectory(prefix="repo-sync-gnupg-") as home:
         os.chmod(home, 0o700)
-        subprocess.run(  # noqa: S603 - fixed argv
+        imported = subprocess.run(  # noqa: S603 - fixed argv
             ["gpg", "--homedir", home, "--batch", "--import", key_file],  # noqa: S607
-            check=True,
+            check=False,
             capture_output=True,
             timeout=60,
         )
+        if imported.returncode != 0:
+            # gpg's messages name the key, never its material.
+            detail = " ".join(imported.stderr.decode(errors="replace").split())[-300:]
+            raise RuntimeError(f"cannot import signing key {key_file} (passphrase-less key required): {detail}")
         previous = os.environ.get("GNUPGHOME")
         os.environ["GNUPGHOME"] = home
         try:
@@ -112,9 +118,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command == "report":
-        status, output, perf = report(config, State.load(root / "repo-sync-state.json"), utcnow())
+        try:
+            status, output, perf = report(config, State.load(root / "repo-sync-state.json"), utcnow())
+        except RuntimeError as exc:
+            print(f"3\tREPO UNKNOWN - {exc}|")
+            return 0
         print(f"{status}\t{output}|{perf}")
         return 0
+
+    # docker stop sends SIGTERM to PID 1: unwind so the lock is released, the
+    # temporary GNUPGHOME removed and the running aptly child killed.
+    signal.signal(signal.SIGTERM, _terminate)
 
     os.umask(0o022)  # published files must be readable by the web server
     try:
@@ -138,6 +152,11 @@ def main(argv: list[str] | None = None) -> int:
     status, output, _ = report(config, State.load(root / "repo-sync-state.json"), utcnow())
     log.info("%s", output)
     return 0
+
+
+def _terminate(signum: int, _frame: FrameType | None) -> None:
+    logging.getLogger("repo_sync").warning("signal %d, stopping", signum)
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":

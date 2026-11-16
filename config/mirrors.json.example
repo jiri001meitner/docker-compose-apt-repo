@@ -13,7 +13,7 @@
       "title": "Caddy",
       "url": "https://dl.cloudsmith.io/public/caddy/stable/deb/debian",
       "distribution": "any-version",
-      "components": ["main"],
+      "component": "main",
       "architectures": ["amd64"],
       "key_file": "/etc/repo-sync/keys/caddy.asc",
       "prefix": "caddy"

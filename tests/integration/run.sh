@@ -74,10 +74,10 @@ cat > "${work}/mirrors.json" <<EOF
   "site_title": "Test <repo>", "base_url": "https://repo.test",
   "mirrors": [
     {"name": "fixture", "title": "Fixture", "url": "http://127.0.0.1:8080", "distribution": "resolute",
-     "components": ["main"], "architectures": ["amd64"], "key_file": "${keys}/upstream.asc",
+     "component": "main", "architectures": ["amd64"], "key_file": "${keys}/upstream.asc",
      "prefix": "ppa/fixture"},
     {"name": "dead", "title": "Dead upstream", "url": "http://127.0.0.1:9", "distribution": "resolute",
-     "components": ["main"], "architectures": ["amd64"], "key_file": "${keys}/upstream.asc",
+     "component": "main", "architectures": ["amd64"], "key_file": "${keys}/upstream.asc",
      "prefix": "dead"}
   ]
 }
@@ -89,8 +89,27 @@ export REPO_SYNC_SIGNING_KEY="${keys}/signing.asc"
 pub="${root}/public"
 site="${root}/site"
 
+# repo-sync runs as in production: uid 10200, and with a restrictive umask
+# of the caller (it must still publish files the web server can read).
+home="${work}/home"
+install -d -o 10200 -g 10200 -m 0755 "${root}" "${home}"
+chown 10200:10200 "${keys}/signing.asc"
+repo_sync() {
+   (umask 077; setpriv --reuid=10200 --regid=10200 --clear-groups env HOME="${home}" python3 -m repo_sync "$@")
+}
+set_mirror() {  # set_mirror <python expression on m (the fixture mirror)>
+   python3 - "${work}/mirrors.json" "$1" <<'PY'
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+c = json.load(open(path))
+m = c["mirrors"][0]
+exec(expr)
+json.dump(c, open(path, "w"), indent=1)
+PY
+}
+
 # --- run 1 ------------------------------------------------------------------
-python3 -m repo_sync sync 2>"${work}/sync1.log" || { cat "${work}/sync1.log"; fail "sync 1 exit code"; }
+repo_sync sync 2>"${work}/sync1.log" || { cat "${work}/sync1.log"; fail "sync 1 exit code"; }
 [[ -f "${pub}/ppa/fixture/dists/resolute/InRelease" ]] || fail "fixture not published"
 pass "fixture published under nested prefix"
 [[ ! -e "${pub}/dead" ]] || fail "dead mirror must not be published"
@@ -102,8 +121,15 @@ grep -q '^Package: hello-data' "${pub}/ppa/fixture/dists/resolute/main/binary-am
    || fail "arch:all package missing"
 pass "only amd64 + all mirrored"
 # Scope is checked on the request path; a symlink could point across scopes.
-[[ -z "$(find "${pub}" -type l)" ]] || fail "symlinks in the published tree"
-pass "published tree has no symlinks"
+# The only ones allowed are aptly's by-hash links to indexes of the same
+# distribution (Acquire-By-Hash); packages are hardlinks.
+while IFS= read -r link; do
+   dist_dir="${link%%/main/*}"
+   [[ "${link}" == */by-hash/* && "$(realpath "${link}")" == "${dist_dir}"/* ]] \
+      || fail "symlink out of place: ${link} -> $(readlink "${link}")"
+done < <(find "${pub}" -type l)
+[[ -z "$(find "${pub}" -path '*/pool/*' -type l)" ]] || fail "symlink in pool"
+pass "only by-hash symlinks, all inside their distribution"
 grep -q '^Origin: repo.test' "${pub}/ppa/fixture/dists/resolute/Release" || fail "origin not set"
 cmp -s <(gpg --dearmor < "${site}/key.asc") <(gpg --dearmor < "${keys}/repo-public.asc") || fail "key.asc differs"
 gpg --dearmor < "${keys}/repo-public.asc" > "${keys}/repo-public.gpg"
@@ -120,7 +146,7 @@ assert s["fixture"]["packages"] == 2 and not s["fixture"]["last_attempt_failed"]
 assert s["dead"]["last_attempt_failed"] and s["dead"]["last_success"] is None, s["dead"]
 PY
 pass "catalogue written"
-report="$(python3 -m repo_sync report)"
+report="$(repo_sync report)"
 [[ "${report}" == 1$'\t'"REPO WARNING"* && "${report}" == *"last attempt failed: dead"* ]] \
    || fail "report: ${report}"
 pass "report flags dead mirror as WARNING"
@@ -128,11 +154,19 @@ if compgen -G "/tmp/repo-sync-gnupg-*" >/dev/null || compgen -G "${root}/repo-sy
    fail "temporary GNUPGHOME left behind"
 fi
 pass "no signing key material left on disk"
+[[ -z "$(find "${pub}" "${site}" ! -perm -o+r)" ]] || fail "files not readable by the web server"
+[[ -z "$(find "${pub}" "${site}" -type d ! -perm -o+x)" ]] || fail "directories not traversable"
+pass "published files world-readable despite umask 077"
+[[ -z "$(ls -A "${home}")" ]] || fail "repo-sync wrote into HOME: $(ls -A "${home}")"
+pass "nothing written to HOME"
+grep -q '^Acquire-By-Hash: yes' "${pub}/ppa/fixture/dists/resolute/Release" || fail "no Acquire-By-Hash"
+[[ -d "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/by-hash" ]] || fail "no by-hash directory"
+pass "indexes published by hash"
 
 # --- run 2: unchanged upstream ---------------------------------------------
 before="$(sha256sum "${pub}/ppa/fixture/dists/resolute/InRelease")"
 sleep 1
-python3 -m repo_sync sync 2>"${work}/sync2.log" || fail "sync 2 exit code"
+repo_sync sync 2>"${work}/sync2.log" || fail "sync 2 exit code"
 grep -q 'mirror fixture: no change' "${work}/sync2.log" || fail "expected no change"
 [[ "$(sha256sum "${pub}/ppa/fixture/dists/resolute/InRelease")" == "${before}" ]] || fail "republished unchanged"
 pass "unchanged upstream is not republished"
@@ -141,22 +175,58 @@ pass "unchanged upstream is not republished"
 mkpkg hello 1.1 amd64
 publish_upstream
 sleep 1
-python3 -m repo_sync sync 2>"${work}/sync3.log" || fail "sync 3 exit code"
+repo_sync sync 2>"${work}/sync3.log" || fail "sync 3 exit code"
 grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "1.1 not published"
 pass "new upstream version switched in"
 
 # --- run 4: upstream breaks (bad signature) keeps last good ------------------
 echo tampered >> "${up}/dists/resolute/Release"
 sleep 1
-python3 -m repo_sync sync 2>"${work}/sync4.log" || fail "sync 4 exit code"
+repo_sync sync 2>"${work}/sync4.log" || fail "sync 4 exit code"
 grep -q 'mirror fixture:' "${work}/sync4.log" || fail "no error logged for tampered upstream"
 grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "last good lost"
 pass "tampered upstream rejected, last good snapshot still served"
+publish_upstream
+
+# --- run 5: architectures added -------------------------------------------------
+set_mirror 'm["architectures"] = ["amd64", "i386"]'
+sleep 1
+repo_sync sync 2>"${work}/sync5.log" || fail "sync 5 exit code"
+grep -q '^Architectures: amd64 i386\|^Architectures: i386 amd64' "${pub}/ppa/fixture/dists/resolute/Release" \
+   || { grep Architectures "${pub}/ppa/fixture/dists/resolute/Release"; fail "i386 not in Release"; }
+grep -q '^Package: hello$' "${pub}/ppa/fixture/dists/resolute/main/binary-i386/Packages" || fail "no i386 index"
+pass "added architecture is published"
+set_mirror 'm["architectures"] = ["amd64"]'
+sleep 1
+repo_sync sync 2>"${work}/sync5b.log" || fail "sync 5b exit code"
+[[ ! -e "${pub}/ppa/fixture/dists/resolute/main/binary-i386" ]] || fail "i386 index still published"
+pass "removed architecture is unpublished"
+
+# --- run 6: prefix moved ------------------------------------------------------------
+set_mirror 'm["prefix"] = "ppa/moved"'
+sleep 1
+repo_sync sync 2>"${work}/sync6.log" || fail "sync 6 exit code"
+[[ -f "${pub}/ppa/moved/dists/resolute/InRelease" ]] || fail "not published at new prefix"
+[[ ! -e "${pub}/ppa/fixture/dists" ]] || fail "old prefix still published"
+pass "prefix change moves the publication"
+
+# --- run 7: renamed while upstream is down, then up ---------------------------------
+set_mirror 'm["name"] = "renamed"; m["url"] = "http://127.0.0.1:9"'
+sleep 1
+repo_sync sync 2>"${work}/sync7.log" || fail "sync 7 exit code"
+[[ -f "${pub}/ppa/moved/dists/resolute/InRelease" ]] || fail "prefix emptied while successor is down"
+pass "renamed mirror with dead upstream keeps the prefix served"
+set_mirror 'm["url"] = "http://127.0.0.1:8080"'
+sleep 1
+repo_sync sync 2>"${work}/sync7b.log" || fail "sync 7b exit code"
+grep -q 'Version: 1.1' "${pub}/ppa/moved/dists/resolute/main/binary-amd64/Packages" || fail "successor not published"
+grep -q 'mirror fixture removed from config' "${work}/sync7b.log" "${work}/sync7.log" || fail "old mirror not dropped"
+pass "successor took over, old mirror dropped"
 
 # --- concurrent run is refused ------------------------------------------------
 exec 9>"${root}/.repo-sync.lock"
 flock -n 9
-rc=0; python3 -m repo_sync sync 2>/dev/null || rc=$?
+rc=0; repo_sync sync 2>/dev/null || rc=$?
 [[ "${rc}" == 75 ]] || fail "locked run exit ${rc}"
 exec 9>&-
 pass "concurrent run refused with 75"
@@ -166,7 +236,7 @@ install -d -m 0755 /etc/apt/keyrings
 cp "${keys}/repo-public.asc" /etc/apt/keyrings/repo-test.asc
 cat > /etc/apt/sources.list.d/repo-test.sources <<EOF
 Types: deb
-URIs: file://${pub}/ppa/fixture/
+URIs: file://${pub}/ppa/moved/
 Suites: resolute
 Components: main
 Architectures: amd64

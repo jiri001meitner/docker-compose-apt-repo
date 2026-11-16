@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -11,7 +12,7 @@ from typing import Any
 from unittest import mock
 
 from repo_sync import sync as sync_mod
-from repo_sync.aptly import AptlyError
+from repo_sync.aptly import AptlyError, Publication
 from repo_sync.catalog import CRITICAL, OK, WARNING, render_index, render_status, report
 from repo_sync.config import ConfigError, parse_config
 from repo_sync.sync import State, Syncer
@@ -35,7 +36,7 @@ def config_json(**over: Any) -> dict[str, Any]:
                 "title": "Caddy",
                 "url": "https://up.test/caddy",
                 "distribution": "any-version",
-                "components": ["main"],
+                "component": "main",
                 "architectures": ["amd64"],
                 "key_file": "/keys/caddy.asc",
                 "prefix": "caddy",
@@ -45,7 +46,7 @@ def config_json(**over: Any) -> dict[str, Any]:
                 "title": "Mozilla",
                 "url": "https://up.test/moz",
                 "distribution": "resolute",
-                "components": ["main"],
+                "component": "main",
                 "architectures": ["amd64"],
                 "key_file": "/keys/moz.asc",
                 "prefix": "ppa/mozillateam",
@@ -57,15 +58,17 @@ def config_json(**over: Any) -> dict[str, Any]:
 
 
 class FakeAptly:
-    """Models mirrors (with an upstream 'version'), snapshots and publishes."""
+    """Models mirrors (with an upstream 'version'), snapshots and publications."""
 
     def __init__(self) -> None:
         self.upstream: dict[str, int] = {"caddy": 1, "ppa-moz": 1}
-        self.fail: set[str] = set()
+        self.fail: dict[str, BaseException] = {}
+        self.fail_drop: set[str] = set()
         self.mirror_content: dict[str, int] = {}
+        self.mirror_url: dict[str, str] = {}
         self.snaps: dict[str, int] = {}
         self.order: list[str] = []
-        self.pub: dict[tuple[str, str], str] = {}
+        self.pub: dict[tuple[str, str], Publication] = {}
         self.calls: list[tuple[Any, ...]] = []
 
     def mirrors(self) -> set[str]:
@@ -74,6 +77,7 @@ class FakeAptly:
     def mirror_create(self, mirror: Any, keyring: str) -> None:
         self.calls.append(("create", mirror.name))
         self.mirror_content[mirror.name] = 0
+        self.mirror_url[mirror.name] = mirror.url
 
     def mirror_drop(self, name: str) -> None:
         self.calls.append(("mirror_drop", name))
@@ -81,19 +85,21 @@ class FakeAptly:
 
     def mirror_update(self, name: str, keyring: str) -> None:
         if name in self.fail:
-            raise AptlyError(["mirror", "update"], 1, "ERROR: unable to fetch: 504 Gateway Timeout")
-        self.mirror_content[name] = self.upstream[name]
+            raise self.fail[name]
+        self.mirror_content[name] = self.upstream.get(name, 1)
 
     def snapshots(self) -> list[str]:
         return list(self.order)
 
     def snapshot_create(self, name: str, mirror: str) -> None:
-        assert name not in self.snaps
+        assert name not in self.snaps, f"duplicate snapshot {name}"
         self.snaps[name] = self.mirror_content[mirror]
         self.order.append(name)
 
     def snapshot_drop(self, name: str) -> None:
-        assert name not in self.pub.values(), f"dropping published snapshot {name}"
+        if name in self.fail_drop:
+            raise AptlyError(["snapshot", "drop"], 1, "ERROR: snapshot is published")
+        assert name not in {p.snapshot for p in self.pub.values()}, f"dropping published snapshot {name}"
         self.calls.append(("snap_drop", name))
         del self.snaps[name]
         self.order.remove(name)
@@ -104,16 +110,19 @@ class FakeAptly:
     def snapshot_packages(self, name: str) -> int:
         return 10 + self.snaps[name]
 
-    def published(self) -> set[tuple[str, str]]:
-        return set(self.pub)
+    def publications(self) -> dict[tuple[str, str], Publication]:
+        return dict(self.pub)
 
-    def publish_snapshot(self, snap: str, prefix: str, dist: str, archs: Any) -> None:
-        self.calls.append(("publish", prefix, snap))
-        self.pub[(prefix, dist)] = snap
+    def publish_snapshot(self, snap: str, mirror: Any) -> None:
+        key = (mirror.prefix, mirror.distribution)
+        assert key not in self.pub, f"already published at {key}"
+        self.calls.append(("publish", mirror.prefix, snap))
+        self.pub[key] = Publication(snap, mirror.component, mirror.architectures, True)
 
     def publish_switch(self, snap: str, prefix: str, dist: str) -> None:
         self.calls.append(("switch", prefix, snap))
-        self.pub[(prefix, dist)] = snap
+        old = self.pub[(prefix, dist)]
+        self.pub[(prefix, dist)] = Publication(snap, old.component, old.architectures, old.acquire_by_hash)
 
     def publish_drop(self, prefix: str, dist: str) -> None:
         self.calls.append(("pub_drop", prefix))
@@ -136,10 +145,14 @@ class SyncTest(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         self.addCleanup(self.tmp.cleanup)
 
-    def run_sync(self, cfg: dict[str, Any] | None = None) -> State:
-        self.clock += timedelta(hours=6)
+    def run_sync(self, cfg: dict[str, Any] | None = None, advance: bool = True) -> State:
+        if advance:
+            self.clock += timedelta(hours=6)
         config = parse_config(json.dumps(cfg or config_json()))
         return Syncer(config, self.aptly, self.root, self.root).run()  # type: ignore[arg-type]
+
+    def published(self, prefix: str, dist: str) -> str:
+        return self.aptly.pub[(prefix, dist)].snapshot
 
     def test_first_run_publishes_all(self) -> None:
         state = self.run_sync()
@@ -161,22 +174,28 @@ class SyncTest(unittest.TestCase):
             self.run_sync()
         caddy_snaps = [s for s in self.aptly.order if s.startswith("caddy-")]
         self.assertEqual(len(caddy_snaps), 2)  # keep_snapshots = 2
-        self.assertEqual(self.aptly.pub[("caddy", "any-version")], caddy_snaps[-1])
+        self.assertEqual(self.published("caddy", "any-version"), caddy_snaps[-1])
         self.assertEqual(self.aptly.snaps[caddy_snaps[-1]], 4)
 
     def test_failure_is_isolated_and_keeps_publish(self) -> None:
         self.run_sync()
-        published = self.aptly.pub[("ppa/mozillateam", "resolute")]
-        self.aptly.fail.add("ppa-moz")
+        published = self.published("ppa/mozillateam", "resolute")
+        self.aptly.fail["ppa-moz"] = AptlyError(["mirror", "update"], 1, "ERROR: 504 Gateway Timeout")
         self.aptly.upstream["caddy"] = 2
         state = self.run_sync()
-        self.assertEqual(self.aptly.pub[("ppa/mozillateam", "resolute")], published)
+        self.assertEqual(self.published("ppa/mozillateam", "resolute"), published)
         self.assertIn("504", state.mirrors["ppa-moz"].last_error or "")
         self.assertIsNone(state.mirrors["caddy"].last_error)
-        self.assertNotEqual(state.mirrors["ppa-moz"].last_attempt, state.mirrors["ppa-moz"].last_success)
+
+    def test_timeout_is_isolated(self) -> None:
+        self.aptly.fail["caddy"] = subprocess.TimeoutExpired(["aptly"], 21600)
+        state = self.run_sync()
+        self.assertIn("timed out", state.mirrors["caddy"].last_error or "")
+        self.assertIn(("ppa/mozillateam", "resolute"), self.aptly.pub)
+        self.assertIsNotNone(state.last_run)
 
     def test_never_succeeded_mirror_not_published(self) -> None:
-        self.aptly.fail.add("ppa-moz")
+        self.aptly.fail["ppa-moz"] = AptlyError(["mirror", "create"], 1, "connection refused")
         state = self.run_sync()
         self.assertNotIn(("ppa/mozillateam", "resolute"), self.aptly.pub)
         self.assertIsNone(state.mirrors["ppa-moz"].last_success)
@@ -187,7 +206,23 @@ class SyncTest(unittest.TestCase):
         cfg["mirrors"][0]["url"] = "https://up.test/caddy2"
         self.run_sync(cfg)
         self.assertIn(("mirror_drop", "caddy"), self.aptly.calls)
-        self.assertEqual(self.aptly.calls.count(("create", "caddy")), 2)
+        self.assertEqual(self.aptly.mirror_url["caddy"], "https://up.test/caddy2")
+
+    def test_architecture_change_republishes(self) -> None:
+        self.run_sync()
+        cfg = config_json()
+        cfg["mirrors"][0]["architectures"] = ["amd64", "arm64"]
+        self.run_sync(cfg)
+        self.assertEqual(set(self.aptly.pub[("caddy", "any-version")].architectures), {"amd64", "arm64"})
+        self.assertIn(("pub_drop", "caddy"), self.aptly.calls)
+
+    def test_publication_without_acquire_by_hash_is_redone(self) -> None:
+        self.run_sync()
+        old = self.aptly.pub[("caddy", "any-version")]
+        self.aptly.pub[("caddy", "any-version")] = Publication(old.snapshot, old.component, old.architectures, False)
+        self.aptly.upstream["caddy"] = 2
+        self.run_sync()
+        self.assertTrue(self.aptly.pub[("caddy", "any-version")].acquire_by_hash)
 
     def test_prefix_change_moves_publish(self) -> None:
         self.run_sync()
@@ -207,6 +242,53 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("ppa-moz", self.aptly.mirrors())
         self.assertFalse(any(s.startswith("ppa-moz-") for s in self.aptly.order))
 
+    def test_rename_with_dead_upstream_keeps_prefix_served(self) -> None:
+        self.run_sync()
+        old = self.published("ppa/mozillateam", "resolute")
+        cfg = config_json()
+        cfg["mirrors"][1]["name"] = "mozilla"
+        self.aptly.fail["mozilla"] = AptlyError(["mirror", "update"], 1, "Launchpad down")
+        self.run_sync(cfg)
+        self.assertEqual(self.published("ppa/mozillateam", "resolute"), old)
+        del self.aptly.fail["mozilla"]
+        self.run_sync(cfg)
+        self.assertTrue(self.published("ppa/mozillateam", "resolute").startswith("mozilla-"))
+        self.assertFalse(any(s.startswith("ppa-moz-") for s in self.aptly.order))
+        self.assertNotIn("ppa-moz", self.aptly.mirrors())
+
+    def test_prune_error_does_not_block_sync(self) -> None:
+        self.run_sync()
+        cfg = config_json()
+        cfg["mirrors"] = cfg["mirrors"][:1]
+        stuck = self.published("ppa/mozillateam", "resolute")
+        self.aptly.fail_drop.add(stuck)
+        self.aptly.upstream["caddy"] = 2
+        state = self.run_sync(cfg)
+        self.assertIsNone(state.mirrors["caddy"].last_error)
+        self.assertEqual(self.aptly.snaps[self.published("caddy", "any-version")], 2)
+
+    def test_two_runs_in_one_second(self) -> None:
+        self.run_sync()
+        self.aptly.upstream["caddy"] = 2
+        self.run_sync(advance=False)
+        self.aptly.upstream["caddy"] = 3
+        state = self.run_sync(advance=False)
+        self.assertIsNone(state.mirrors["caddy"].last_error)
+        self.assertTrue(self.published("caddy", "any-version").endswith("-2"))
+
+    def test_state_file_lost_heals(self) -> None:
+        self.run_sync()
+        (self.root / "repo-sync-state.json").unlink()
+        self.aptly.upstream["caddy"] = 2
+        state = self.run_sync()
+        self.assertIsNone(state.mirrors["caddy"].last_error)
+        self.assertEqual(self.aptly.snaps[self.published("caddy", "any-version")], 2)
+
+    def test_corrupt_state_is_reported(self) -> None:
+        (self.root / "repo-sync-state.json").write_text("{broken")
+        with self.assertRaises(RuntimeError):
+            State.load(self.root / "repo-sync-state.json")
+
     def test_state_survives_restart(self) -> None:
         self.run_sync()
         self.assertEqual(State.load(self.root / "repo-sync-state.json").mirrors["caddy"].packages, 11)
@@ -214,6 +296,15 @@ class SyncTest(unittest.TestCase):
     def test_lock(self) -> None:
         with sync_mod.run_lock(self.root), self.assertRaises(sync_mod.LockedError), sync_mod.run_lock(self.root):
             pass
+
+
+class DearmorTest(unittest.TestCase):
+    def test_binary_key_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d) / "k.gpg"
+            key.write_bytes(b"\x99\x01\x0d binary keyring")
+            with self.assertRaises(ValueError):
+                sync_mod.dearmor(str(key), Path(d))
 
 
 class CatalogTest(unittest.TestCase):
@@ -267,6 +358,9 @@ class ConfigTest(unittest.TestCase):
             "relative key": mutate(lambda c: c["mirrors"][0].update(key_file="keys/x.asc")),
             "ftp url": mutate(lambda c: c["mirrors"][0].update(url="ftp://x")),
             "no arch": mutate(lambda c: c["mirrors"][0].update(architectures=[])),
+            "component list": mutate(lambda c: c["mirrors"][0].update(component=["main", "contrib"])),
+            "old components key": mutate(lambda c: c["mirrors"][0].update(components=["main"])),
+            "nested prefix": mutate(lambda c: c["mirrors"][1].update(prefix="caddy/sub")),
             "crit < warn": mutate(lambda c: c.update(stale_critical_hours=10)),
             "keep 0": mutate(lambda c: c.update(keep_snapshots=0)),
             "base url slash": mutate(lambda c: c.update(base_url="https://repo.test/")),

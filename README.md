@@ -39,9 +39,11 @@ whether an account exists, is blocked or expired.
   once. Only their SHA-256 is stored, compared in constant time.
 * **Scopes** are path prefixes = publish prefixes (`/caddy/`,
   `/ppa/mozillateam/`, `/` for everything). Finer scopes make no sense:
-  `pool/` is shared by the whole prefix. Scope is checked on the request
-  path; the published tree must contain no symlinks (aptly publishes
-  hardlinks, the integration test checks it).
+  `pool/` is shared by the whole prefix, and prefixes may not be nested
+  (`ppa` next to `ppa/x` is rejected). Scope is checked on the request path,
+  so no symlink may lead across prefixes: packages are hardlinks, the only
+  symlinks are aptly's `by-hash/` links to indexes of the same distribution
+  (the integration test checks both).
 * **Source of truth** is SQLite in `db/`, changed only by `repo-admin`. Every
   change writes `export/clients.json` atomically, under a lock, and only after
   validating it with the same parser `repo-auth` uses (an invalid state fails
@@ -87,23 +89,35 @@ Exit codes: 0 ok, 1 error, 2 not found.
 
 ## Mirrors (repo-sync)
 
-`config/mirrors.json` (see `config/mirrors.json.example`) lists the mirrors;
-the upstream public keys are in `config/keys/`. One run:
+`config/mirrors.json` (see `config/mirrors.json.example`) lists the mirrors,
+each with one `component` (aptly would merge several into one); the
+upstream public keys (armored) are in `config/keys/`. The repository signing
+key must have no passphrase (it is imported with `--batch`). Decisions are
+taken from aptly's real state (`publish list -json`), the state file only
+feeds the catalogue and the report, so an interrupted run heals on the next.
+One run:
 
 1. `aptly mirror update`, verifying the upstream signature with the mirror's
    key only (a tampered upstream is rejected);
 2. snapshot `<mirror>-<UTC timestamp>`; when identical to the published one it
-   is dropped, otherwise the publish is switched (atomic for clients);
+   is dropped, otherwise the publication is switched. Indexes are published
+   with `Acquire-By-Hash`, so a client updating during the switch never
+   mixes old and new indexes;
 3. published Release files are signed with the repository key, which is
    imported into a temporary `GNUPGHOME` for the run only;
 4. `keep_snapshots` newest snapshots per mirror are kept for rollback;
 5. the catalogue is written to `aptly/site/` (`index.html` in Czech and
    English, `status.json`, `key.asc`), separately from `aptly/public/`.
 
-Mirrors are independent: an unreachable upstream (Launchpad outage) leaves its
-last good snapshot published and the others continue. Changing a mirror's
-URL, distribution, components, architectures or filter recreates it;
-changing its prefix moves the publish; removing it from the config drops it.
+Mirrors are independent: an unreachable or hanging upstream (Launchpad
+outage; `mirror update` may take up to 6 h) leaves its last good snapshot
+published and the others continue. Changing a mirror's URL, distribution,
+component, architectures or filter recreates the aptly mirror; a different
+component or architecture set is published again (`publish switch` keeps
+the original layout), with a short gap for that distribution. Changing the
+prefix moves the publication. A mirror removed from the config (or renamed)
+is dropped only after nothing configured needs its publication, so a
+rename while the upstream is down keeps the old content served.
 
 Only the listed architectures are mirrored (`amd64` also brings `all`).
 Clients with a foreign architecture (`i386`) must set `Architectures: amd64`
@@ -128,7 +142,9 @@ internal error, 75 another run holds the lock.
    SOCKET_GID, 2750; on tmpfs `/run` via tmpfiles.d).
 3. Signing key (armored secret key) at `SIGNING_KEY_FILE`, owner SYNC_UID,
    mode 0400; `config/mirrors.json` and `config/keys/*.asc`.
-4. `docker compose build && docker compose up -d repo-auth`.
+4. `docker compose --profile tools build --pull && docker compose up -d repo-auth`
+   (a plain `build` skips `repo-sync` and `repo-admin`, which are in the
+   `tools` profile; rebuild like this to get base image updates).
 5. Caddy site block from `caddy/repo.caddy.example`: catalogue served from
    `aptly/site` without auth, everything else through `forward_auth` from
    `aptly/public` (no `browse`).

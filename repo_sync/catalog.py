@@ -73,7 +73,7 @@ def status_document(config: Config, state: State, now: datetime) -> dict[str, ob
                 "title": h.mirror.title,
                 "path": f"/{h.mirror.prefix}/",
                 "distribution": h.mirror.distribution,
-                "components": list(h.mirror.components),
+                "component": h.mirror.component,
                 "architectures": list(h.mirror.architectures),
                 "upstream": h.mirror.url,
                 "packages": h.state.packages,
@@ -121,7 +121,7 @@ def render_index(config: Config, state: State, now: datetime, key_fingerprint: s
         rows.append(
             "<tr>"
             f"<td><strong>{e(m.title)}</strong><br><code>{e(config.base_url)}/{e(m.prefix)}/</code></td>"
-            f"<td><code>{e(m.distribution)}</code> · {e(' '.join(m.components))}<br>"
+            f"<td><code>{e(m.distribution)}</code> · {e(m.component)}<br>"
             f"{e(', '.join(m.architectures))}</td>"
             f"<td>{st.packages}</td>"
             f'<td class="{status_cls}">{e(st.last_success or "—")}'
@@ -132,7 +132,7 @@ def render_index(config: Config, state: State, now: datetime, key_fingerprint: s
     example = config.mirrors[0] if config.mirrors else None
     sources = (
         f"Types: deb\nURIs: {config.base_url}/{example.prefix}/\nSuites: {example.distribution}\n"
-        f"Components: {' '.join(example.components)}\nArchitectures: amd64\n"
+        f"Components: {example.component}\nArchitectures: amd64\n"
         "Signed-By: /etc/apt/keyrings/repo-mordecai.asc\n"
         if example
         else ""
