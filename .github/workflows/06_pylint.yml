@@ -26,3 +26,8 @@ jobs:
             echo "::error::suppression comments are not allowed"
             exit 1
           fi
+          # The only approved exception: knowledge/linter-vyjimky.md
+          if git grep -n 'noqa' -- '*.py' ':!repo_common/proc.py'; then
+            echo "::error::noqa outside the approved exception"
+            exit 1
+          fi

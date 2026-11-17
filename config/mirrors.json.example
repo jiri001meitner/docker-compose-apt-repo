@@ -1,5 +1,5 @@
 {
-  "gpg_key": "0123456789ABCDEF0123456789ABCDEF01234567",
+  "gpg_key": "FINGERPRINT-OF-THE-SIGNING-KEY-40-HEX-UPPERCASE",
   "origin": "repo.example.org",
   "label": "repo.example.org",
   "keep_snapshots": 3,

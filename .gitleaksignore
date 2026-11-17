@@ -1,0 +1,4 @@
+# Reviewed false positives only; reasons in knowledge/linter-vyjimky.md.
+# Placeholder fingerprint of a public signing key in the example config
+# (replaced by a non-hex placeholder in a later commit).
+25b5406f27170c9d32cd92ee4f0295c515e1788e:config/mirrors.json.example:generic-api-key:2
