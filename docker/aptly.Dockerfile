@@ -16,8 +16,10 @@ RUN apt-get update \
     && groupadd --system --gid 10200 aptly \
     && useradd --system --uid 10200 --gid aptly --home-dir /var/lib/aptly --shell /usr/sbin/nologin aptly
 
+COPY repo_common/ /app/repo_common/
 COPY repo_sync/ /app/repo_sync/
-RUN python3 -m compileall -q /app/repo_sync
+RUN python3 -m compileall -q /app/repo_common /app/repo_sync \
+    && test -x /usr/bin/aptly && test -x /usr/bin/gpg && test -x /usr/bin/gpgconf
 
 USER 10200:10200
 ENTRYPOINT ["python3", "-m", "repo_sync"]

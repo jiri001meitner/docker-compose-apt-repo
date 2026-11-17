@@ -10,6 +10,7 @@ from .server import DEFAULT_SOCKET
 
 
 def main() -> int:
+    """Exit status 0 when /healthz answers 200."""
     path = os.environ.get("REPO_AUTH_SOCKET", DEFAULT_SOCKET)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

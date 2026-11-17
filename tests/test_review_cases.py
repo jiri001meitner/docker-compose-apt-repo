@@ -4,34 +4,35 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import io
 import json
 import os
 import socket
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from repo_auth import server as server_mod
-from repo_auth.admin import Admin, run
+from repo_auth.accounts import Admin, AdminError
 from repo_auth.auth import decide, normalize_path, parse_basic
-from repo_auth.model import parse_export, render_export
+from repo_auth.model import render_export
 from repo_auth.server import make_server
 from repo_auth.store import ExportStore
 
-from .helpers import NOW, TOKEN, basic, entry, export
+from .helpers import NOW, TOKEN, AdminCliCase, basic, entry, export
+from .tempdirs import temp_dir
+
+HEALTHZ = b"GET /healthz HTTP/1.1\r\n\r\n"
 
 
-def raw_request(path: str, data: bytes, *, read: bool = True, timeout: float = 5) -> bytes:
+def raw_request(path: str, data: bytes, *, timeout: float = 5) -> bytes:
+    """Send raw bytes to the socket; everything the server answers until it closes."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect(path)
         s.sendall(data)
-        if not read:
-            return b""
         chunks = []
         while chunk := s.recv(65536):
             chunks.append(chunk)
@@ -39,14 +40,23 @@ def raw_request(path: str, data: bytes, *, read: bool = True, timeout: float = 5
 
 
 def fwd(auth: str | None, uri: str = "/caddy/x", method: str = "GET", extra: str = "") -> bytes:
-    lines = [f"{method} /auth HTTP/1.1", "Host: x", "X-Forwarded-Method: GET", f"X-Forwarded-Uri: {uri}"]
+    """A raw forward_auth request; ``extra`` is appended to the headers as is."""
+    lines = [
+        f"{method} /auth HTTP/1.1",
+        "Host: x",
+        "X-Forwarded-Method: GET",
+        f"X-Forwarded-Uri: {uri}",
+    ]
     if auth:
         lines.append(f"Authorization: {auth}")
     return ("\r\n".join(lines) + "\r\n" + extra + "\r\n").encode()
 
 
 class NormalizeAndParseExtraTest(unittest.TestCase):
+    """Path and header forms that differ between parsers."""
+
     def test_paths(self) -> None:
+        """Encoded slashes, scope boundaries, invalid UTF-8 and the length limit."""
         exp = export(entry(scopes=("/caddy/",)))
         auth = basic("client-one", TOKEN)
 
@@ -66,29 +76,35 @@ class NormalizeAndParseExtraTest(unittest.TestCase):
         self.assertIsNone(normalize_path("/" + "a" * 4096))
 
     def test_basic_variants(self) -> None:
+        """Missing separator, tab, broken padding, empty parts and non-ASCII logins."""
         good = base64.b64encode(f"client-one:{TOKEN}".encode()).decode()
+        broken_padding = good.rstrip("=") if good.endswith("=") else good[:-1]
         self.assertIsNone(parse_basic("Basic" + good))
         self.assertIsNone(parse_basic("Basic\t" + good))
-        self.assertIsNone(parse_basic("Basic " + good.rstrip("=") if good.endswith("=") else "Basic " + good[:-1]))
+        self.assertIsNone(parse_basic("Basic " + broken_padding))
         self.assertIsNone(parse_basic(basic("", TOKEN)))
         self.assertIsNone(parse_basic(basic("client-one", "")))
-        self.assertIsNone(parse_basic("Basic " + base64.b64encode("klient-é:".encode() + b"x" * 40).decode()))
+        non_ascii = base64.b64encode("klient-é:".encode() + b"x" * 40).decode()
+        self.assertIsNone(parse_basic("Basic " + non_ascii))
 
 
 class StoreHealthTest(unittest.TestCase):
+    """Health of the export store when the file breaks or disappears."""
+
     def setUp(self) -> None:
-        self.dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.dir.cleanup)
-        self.path = os.path.join(self.dir.name, "clients.json")
+        """An export path in a temporary directory."""
+        self.dir = temp_dir(self)
+        self.path = os.path.join(self.dir, "clients.json")
 
     def write(self, data: bytes) -> None:
-        with open(self.path + ".tmp", "wb") as fh:
-            fh.write(data)
+        """Replace the export atomically."""
+        Path(self.path + ".tmp").write_bytes(data)
         os.replace(self.path + ".tmp", self.path)
 
     def test_degraded_states(self) -> None:
+        """Broken or deleted export: unhealthy, but the last good one stays in effect."""
         store = ExportStore(self.path)
-        self.assertEqual(store.health()[0], False)
+        self.assertFalse(store.health()[0])
         self.write(render_export(NOW, [entry()]))
         self.assertTrue(store.health()[0])
         self.write(b"{broken")
@@ -104,33 +120,37 @@ class StoreHealthTest(unittest.TestCase):
 
     @unittest.skipIf(os.geteuid() == 0, "root ignores permissions")
     def test_unreadable_dir_keeps_last_good(self) -> None:
+        """An unreadable directory keeps the last good export and reports unhealthy."""
         self.write(render_export(NOW, [entry()]))
         store = ExportStore(self.path)
         self.assertIsNotNone(store.get())
-        os.chmod(self.dir.name, 0)
+        os.chmod(self.dir, 0)
         try:
             self.assertIsNotNone(store.get())
             self.assertFalse(store.health()[0])
         finally:
-            os.chmod(self.dir.name, 0o700)
+            os.chmod(self.dir, 0o700)
 
 
 class ServerHardeningTest(unittest.TestCase):
+    """Request smuggling, header injection, slow and too many clients."""
+
     def setUp(self) -> None:
-        self.dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.dir.cleanup)
-        self.sock = os.path.join(self.dir.name, "auth.sock")
-        self.export = os.path.join(self.dir.name, "clients.json")
-        with open(self.export, "wb") as fh:
-            fh.write(render_export(NOW, [entry()]))
+        """A socket path and an export with one token."""
+        self.dir = temp_dir(self)
+        self.sock = os.path.join(self.dir, "auth.sock")
+        self.export = os.path.join(self.dir, "clients.json")
+        Path(self.export).write_bytes(render_export(NOW, [entry()]))
 
     def start(self, realm: str = "Repo") -> None:
-        self.server = make_server(self.sock, self.export, realm)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
+        """Start the server; it is stopped when the test ends."""
+        server = make_server(self.sock, self.export, realm)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
 
     def test_first_authorization_header_wins_and_head_has_no_body(self) -> None:
+        """A second Authorization header is ignored; HEAD gets headers only."""
         self.start()
         good, bad = basic("client-one", TOKEN), basic("client-one", "z" * 43)
         resp = raw_request(self.sock, fwd(good, extra=f"Authorization: {bad}\r\n"))
@@ -142,29 +162,32 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"X-Repo-", resp)
 
     def test_body_does_not_become_next_request(self) -> None:
+        """A request body is never parsed as a second request."""
         self.start()
         smuggled = b"GET /auth HTTP/1.1\r\nHost: x\r\n\r\n"
-        req = fwd(None, extra=f"Content-Length: {len(smuggled)}\r\n").rstrip(b"\r\n") + b"\r\n\r\n" + smuggled
-        resp = raw_request(self.sock, req)
+        head = fwd(None, extra=f"Content-Length: {len(smuggled)}\r\n").rstrip(b"\r\n")
+        resp = raw_request(self.sock, head + b"\r\n\r\n" + smuggled)
         self.assertEqual(resp.count(b"HTTP/1.1 "), 1)
         self.assertIn(b"Connection: close", resp)
 
     def test_realm_sanitised(self) -> None:
+        """Quotes and line breaks in the realm cannot inject headers."""
         self.start('Evil"\r\nX-Injected: 1')
         resp = raw_request(self.sock, fwd(None))
         self.assertNotIn(b"X-Injected: 1\r\n", resp)
         self.assertIn(b'WWW-Authenticate: Basic realm="EvilX-Injected: 1", charset="UTF-8"', resp)
 
     def test_healthz_reports_degraded(self) -> None:
+        """/healthz turns 503 on a broken export while decisions keep working."""
         self.start()
-        self.assertTrue(raw_request(self.sock, b"GET /healthz HTTP/1.1\r\n\r\n").startswith(b"HTTP/1.1 200"))
-        with open(self.export, "wb") as fh:
-            fh.write(b"{broken")
-        resp = raw_request(self.sock, b"GET /healthz HTTP/1.1\r\n\r\n")
-        self.assertTrue(resp.startswith(b"HTTP/1.1 503"))
-        self.assertTrue(raw_request(self.sock, fwd(basic("client-one", TOKEN))).startswith(b"HTTP/1.1 200"))
+        self.assertTrue(raw_request(self.sock, HEALTHZ).startswith(b"HTTP/1.1 200"))
+        Path(self.export).write_bytes(b"{broken")
+        self.assertTrue(raw_request(self.sock, HEALTHZ).startswith(b"HTTP/1.1 503"))
+        allowed = raw_request(self.sock, fwd(basic("client-one", TOKEN)))
+        self.assertTrue(allowed.startswith(b"HTTP/1.1 200"))
 
     def test_slow_client_is_cut_off(self) -> None:
+        """A client trickling bytes within the read timeout is cut at the deadline."""
         with (
             mock.patch.object(server_mod, "REQUEST_DEADLINE", 0.5),
             mock.patch.object(server_mod.Handler, "timeout", 0.3),
@@ -183,60 +206,44 @@ class ServerHardeningTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, 2.5)
 
     def test_concurrency_limit(self) -> None:
+        """Above the limit the answer is an immediate 503; freed slots are reused."""
         with mock.patch.object(server_mod, "MAX_CONCURRENT", 2):
             self.start()
-            idle = []
-            for _ in range(2):
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.connect(self.sock)
-                idle.append(s)
-            time.sleep(0.2)
-            resp = raw_request(self.sock, fwd(basic("client-one", TOKEN)))
-            self.assertTrue(resp.startswith(b"HTTP/1.1 503"), resp[:40])
-            for s in idle:
-                s.close()
+            with contextlib.ExitStack() as idle:
+                for _ in range(2):
+                    s = idle.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+                    s.connect(self.sock)
+                time.sleep(0.2)
+                resp = raw_request(self.sock, fwd(basic("client-one", TOKEN)))
+                self.assertTrue(resp.startswith(b"HTTP/1.1 503"), resp[:40])
             time.sleep(0.3)
-            self.assertTrue(raw_request(self.sock, fwd(basic("client-one", TOKEN))).startswith(b"HTTP/1.1 200"))
+            resp = raw_request(self.sock, fwd(basic("client-one", TOKEN)))
+            self.assertTrue(resp.startswith(b"HTTP/1.1 200"))
 
 
-class AdminReviewTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.dir.cleanup)
-        self.db = os.path.join(self.dir.name, "db", "repo.sqlite3")
-        self.export = os.path.join(self.dir.name, "export", "clients.json")
-
-    def cli(self, *argv: str, stdin: str = "") -> tuple[int, str, str]:
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(err),
-            mock.patch("sys.stdin", io.StringIO(stdin)),
-        ):
-            code = run(["--db", self.db, "--export", self.export, *argv])
-        return code, out.getvalue(), err.getvalue()
-
-    def active(self) -> set[str]:
-        with open(self.export, "rb") as fh:
-            return set(parse_export(fh.read()).tokens)
+class AdminReviewTest(AdminCliCase):
+    """repo-admin failure modes and concurrency."""
 
     def test_invalid_db_state_fails_loudly(self) -> None:
+        """A database that yields an invalid export fails the command; the export stays."""
         self.cli("account", "add", "acme", "--name", "A", "--scope", "/caddy", "--unlimited")
         self.cli("token", "add", "acme", "--login", "acme-one")
         with sqlite3.connect(self.db) as conn:
-            conn.execute("UPDATE accounts SET scopes = ? WHERE id = 'acme'", (json.dumps(["/caddy"]),))
-        before = open(self.export, "rb").read()
+            conn.execute(
+                "UPDATE accounts SET scopes = ? WHERE id = 'acme'", (json.dumps(["/caddy"]),)
+            )
+        before = Path(self.export).read_bytes()
         code, _, err = self.cli("account", "block", "acme")
         self.assertEqual(code, 1)
         self.assertIn("invalid export", err)
-        self.assertEqual(open(self.export, "rb").read(), before)
+        self.assertEqual(Path(self.export).read_bytes(), before)
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores permissions")
     def test_token_printed_only_after_export(self) -> None:
+        """When the export cannot be written, no token is printed."""
         self.cli("account", "add", "acme", "--name", "A", "--scope", "/", "--unlimited")
         os.chmod(os.path.dirname(self.export), 0o500)
         try:
-            if os.geteuid() == 0:
-                self.skipTest("root ignores permissions")
             code, out, err = self.cli("token", "add", "acme", "--login", "acme-one")
         finally:
             os.chmod(os.path.dirname(self.export), 0o700)
@@ -245,24 +252,25 @@ class AdminReviewTest(unittest.TestCase):
         self.assertIn("cannot write export", err)
 
     def test_sync_leaves_manual_tokens(self) -> None:
+        """token sync never revokes tokens it did not create."""
         self.cli("account", "ensure", "linuxadm", "--name", "H", "--scope", "/", "--unlimited")
         self.cli("token", "add", "linuxadm", "--login", "manual-one")
         self.cli("token", "sync", "linuxadm", stdin=json.dumps({"host-a1": "a" * 64}))
         self.assertEqual(self.active(), {"manual-one", "host-a1"})
-        self.assertEqual(self.cli("token", "sync", "linuxadm", stdin="{}")[1].split()[-1], "CHANGED")
+        self.assertEqual(self.marker("token", "sync", "linuxadm", stdin="{}"), "CHANGED")
         self.assertEqual(self.active(), {"manual-one"})
 
     def test_ensure_keeps_block(self) -> None:
-        self.cli("account", "ensure", "acme", "--name", "A", "--scope", "/", "--unlimited")
+        """account ensure does not lift a block."""
+        ensure = ("account", "ensure", "acme", "--name", "A", "--scope", "/", "--unlimited")
+        self.cli(*ensure)
         self.cli("token", "add", "acme", "--login", "acme-one")
         self.cli("account", "block", "acme")
-        self.assertEqual(
-            self.cli("account", "ensure", "acme", "--name", "A", "--scope", "/", "--unlimited")[1].split()[-1], "OK"
-        )
-        with open(self.export, "rb") as fh:
-            self.assertTrue(parse_export(fh.read()).tokens["acme-one"].blocked)
+        self.assertEqual(self.marker(*ensure), "OK")
+        self.assertTrue(self.exported().tokens["acme-one"].blocked)
 
     def test_concurrent_admins_end_with_latest_state(self) -> None:
+        """Parallel repo-admin runs never leave an export older than the database."""
         self.cli("account", "add", "acme", "--name", "A", "--scope", "/", "--unlimited")
         logins = [f"acme-{i:02d}" for i in range(12)]
         errors: list[str] = []
@@ -273,7 +281,7 @@ class AdminReviewTest(unittest.TestCase):
             try:
                 admin.token_add("acme", login, None)
                 admin.write_export()
-            except Exception as exc:
+            except (AdminError, sqlite3.Error, OSError) as exc:
                 errors.append(repr(exc))
             finally:
                 admin.close()
@@ -287,10 +295,12 @@ class AdminReviewTest(unittest.TestCase):
         self.assertEqual(self.active(), set(logins))
 
     def test_wal_files_private(self) -> None:
+        """The database and its WAL files are readable by the owner only."""
         self.cli("account", "add", "acme", "--name", "A", "--scope", "/", "--unlimited")
         for name in os.listdir(os.path.dirname(self.db)):
             with self.subTest(name):
-                self.assertEqual(os.stat(os.path.join(os.path.dirname(self.db), name)).st_mode & 0o077, 0)
+                mode = os.stat(os.path.join(os.path.dirname(self.db), name)).st_mode
+                self.assertEqual(mode & 0o077, 0)
 
 
 if __name__ == "__main__":

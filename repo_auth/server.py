@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from types import FrameType
+from typing import Any, override
 
 from .auth import decide
 from .store import ExportStore
@@ -42,25 +43,76 @@ _BUSY = (
 )
 
 
+# What socketserver hands to process_request (a datagram server passes a tuple).
+type _Request = socket.socket | tuple[bytes, socket.socket]
+
+
+class Slots:
+    """Counter of busy handler threads; taking a slot never blocks.
+
+    A slot is taken in the accepting thread and released by the handler
+    thread, so it cannot be a ``with`` block around one piece of code.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._busy = 0
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        """Take a slot; False when all are busy."""
+        with self._lock:
+            if self._busy >= self._limit:
+                return False
+            self._busy += 1
+            return True
+
+    def release(self) -> None:
+        """Give a slot back; releasing more than was taken is a bug."""
+        with self._lock:
+            if self._busy <= 0:
+                raise RuntimeError("slot released twice")
+            self._busy -= 1
+
+
+def _stream(request: _Request) -> socket.socket:
+    return request if isinstance(request, socket.socket) else request[1]
+
+
+def _reject_busy(sock: socket.socket) -> None:
+    """Answer 503 without a handler thread."""
+    with contextlib.suppress(OSError):
+        # Read what the client already sent, so closing does not reset the
+        # connection before it sees the 503.
+        sock.settimeout(0.2)
+        sock.recv(65536)
+        sock.sendall(_BUSY)
+
+
+def _abort(sock: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+
+
 class _Server(socketserver.ThreadingUnixStreamServer):
+    """Threaded UNIX socket server with a concurrency limit and a per-connection deadline."""
+
     daemon_threads = True
     block_on_close = False
-    store: ExportStore
-    realm: str
 
-    def __init__(self, path: str, handler: type[BaseHTTPRequestHandler]) -> None:
+    def __init__(
+        self, path: str, handler: type[BaseHTTPRequestHandler], store: ExportStore, realm: str
+    ) -> None:
         super().__init__(path, handler)
-        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+        self.store = store
+        self.realm = realm
+        self._slots = Slots(MAX_CONCURRENT)
 
-    def process_request(self, request: socket.socket, client_address: object) -> None:  # type: ignore[override]
-        if not self._slots.acquire(blocking=False):
+    @override
+    def process_request(self, request: _Request, client_address: Any) -> None:
+        if not self._slots.take():
             log.warning("too many concurrent requests (%d), answering 503", MAX_CONCURRENT)
-            with contextlib.suppress(OSError):
-                # Read what the client already sent, so closing does not reset
-                # the connection before it sees the 503.
-                request.settimeout(0.2)
-                request.recv(65536)
-                request.sendall(_BUSY)
+            _reject_busy(_stream(request))
             self.shutdown_request(request)
             return
         try:
@@ -69,8 +121,9 @@ class _Server(socketserver.ThreadingUnixStreamServer):
             self._slots.release()
             raise
 
-    def process_request_thread(self, request: socket.socket, client_address: object) -> None:  # type: ignore[override]
-        deadline = threading.Timer(REQUEST_DEADLINE, _abort, args=(request,))
+    @override
+    def process_request_thread(self, request: _Request, client_address: Any) -> None:
+        deadline = threading.Timer(REQUEST_DEADLINE, _abort, args=(_stream(request),))
         deadline.daemon = True
         deadline.start()
         try:
@@ -80,23 +133,23 @@ class _Server(socketserver.ThreadingUnixStreamServer):
             self._slots.release()
 
 
-def _abort(request: socket.socket) -> None:
-    with contextlib.suppress(OSError):
-        request.shutdown(socket.SHUT_RDWR)
-
-
 class Handler(BaseHTTPRequestHandler):
+    """One forward_auth request per connection."""
+
     server: _Server
     server_version = "repo-auth"
     sys_version = ""
     protocol_version = "HTTP/1.1"
     timeout = REQUEST_TIMEOUT
 
-    # UNIX sockets have no peer address; BaseHTTPRequestHandler expects one.
+    @override
     def address_string(self) -> str:
+        """UNIX sockets have no peer address; BaseHTTPRequestHandler expects one."""
         return "unix"
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+    @override
+    def log_message(self, format: str, *args: Any) -> None:
+        """Route http.server's own messages to logging at debug level."""
         log.debug("http: " + format, *args)
 
     def _reply(self, status: int, text: str, headers: dict[str, str] | None = None) -> None:
@@ -116,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _handle(self) -> None:
+    def _dispatch(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/healthz":
             ok, reason = self.server.store.health()
@@ -141,18 +194,16 @@ class Handler(BaseHTTPRequestHandler):
             (self.headers.get("X-Forwarded-Uri") or "")[:200],
         )
         headers: dict[str, str] = {}
-        if decision.status == 401:
+        if decision.status == HTTPStatus.UNAUTHORIZED:
             headers["WWW-Authenticate"] = f'Basic realm="{self.server.realm}", charset="UTF-8"'
-        if decision.status == 200 and decision.login and decision.account:
+        if decision.status == HTTPStatus.OK and decision.login and decision.account:
             headers["X-Repo-Client"] = decision.login
             headers["X-Repo-Account"] = decision.account
         self._reply(decision.status, HTTPStatus(decision.status).phrase, headers)
 
-    def do_GET(self) -> None:
-        self._handle()
-
-    def do_HEAD(self) -> None:
-        self._handle()
+    # http.server looks the handlers up by these names.
+    do_GET = _dispatch
+    do_HEAD = _dispatch
 
 
 def _prepare_socket(path: str) -> None:
@@ -165,20 +216,25 @@ def _prepare_socket(path: str) -> None:
     os.unlink(path)
 
 
+def safe_realm(realm: str) -> str:
+    """Realm usable inside a quoted header value."""
+    return "".join(c for c in realm if c.isprintable() and c not in '"\\') or DEFAULT_REALM
+
+
 def make_server(socket_path: str, export_path: str, realm: str) -> _Server:
+    """Bind the socket (0660) and attach the export store."""
     _prepare_socket(socket_path)
     old_umask = os.umask(0o117)  # socket created as 0660
     try:
-        server = _Server(socket_path, Handler)
+        server = _Server(socket_path, Handler, ExportStore(export_path), safe_realm(realm))
     finally:
         os.umask(old_umask)
     os.chmod(socket_path, SOCKET_MODE)
-    server.store = ExportStore(export_path)
-    server.realm = "".join(c for c in realm if c.isprintable() and c not in '"\\') or DEFAULT_REALM
     return server
 
 
 def main() -> None:
+    """Run the service until SIGTERM."""
     logging.basicConfig(
         level=os.environ.get("REPO_AUTH_LOG_LEVEL", "INFO"),
         format="%(levelname)s %(name)s: %(message)s",

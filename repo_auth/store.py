@@ -44,6 +44,7 @@ class ExportStore:
         return _Stamp(st.st_ino, st.st_size, st.st_mtime_ns)
 
     def get(self) -> Export | None:
+        """The current export, reloading it when the file changed."""
         stamp = self._current_stamp()
         with self._lock:
             if stamp is None:
@@ -80,9 +81,12 @@ class ExportStore:
             return self._export
 
     def health(self) -> tuple[bool, str]:
-        """(healthy, reason). Unhealthy also when the newest file is unusable and
-        an older export is still being served: decisions keep working, but the
-        last change made by repo-admin (a block, a revocation) is not in effect."""
+        """Return (healthy, reason).
+
+        Unhealthy also when the newest file is unusable and an older export is
+        still being served: decisions keep working, but the last change made by
+        repo-admin (a block, a revocation) is not in effect.
+        """
         export = self.get()
         with self._lock:
             if export is None:

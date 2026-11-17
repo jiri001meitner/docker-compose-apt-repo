@@ -6,39 +6,84 @@ import html
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import resources
+from string import Template
+
+from repo_common.timeutil import format_utc, parse_optional_utc
 
 from .config import Config, Mirror
-from .sync import MirrorState, State, from_iso, iso
+from .sync import MirrorState, State
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+SECONDS_PER_HOUR = 3600
+KEYRING_PATH = "/etc/apt/keyrings/repo-mordecai.asc"
+
+# Texts of index.html: placeholder -> (Czech, English).
+TEXTS = {
+    "t_intro": (
+        "Zrcadla APT repozitářů. Stahování vyžaduje přístupové údaje.",
+        "APT repository mirrors. Downloads require credentials.",
+    ),
+    "t_updated": ("Aktualizováno", "Updated"),
+    "t_mirrors": ("Zrcadla", "Mirrors"),
+    "t_mirror": ("Zrcadlo", "Mirror"),
+    "t_distribution": ("Distribuce", "Distribution"),
+    "t_packages": ("Balíčky", "Packages"),
+    "t_last_sync": ("Poslední synchronizace (UTC)", "Last sync (UTC)"),
+    "t_failed": (
+        "poslední pokus o stažení ze zdroje selhal, nabízí se poslední úspěšný stav",
+        "the last attempt to fetch from upstream failed; the last good state is served",
+    ),
+    "t_client": ("Nastavení klienta", "Client setup"),
+    "t_key": ("Klíč repozitáře", "Repository key"),
+    "t_fingerprint": ("otisk", "fingerprint"),
+    "t_credentials": ("Přístupové údaje (soubor jen pro root)", "Credentials (root-only file)"),
+    "t_source": ("Zdroj (příklad)", "Source (example)"),
+    "t_status": ("Stav strojově", "Machine-readable status"),
+}
+LEVEL_CLASSES = {OK: "ok", WARNING: "warning", CRITICAL: "critical"}
 
 
 @dataclass(frozen=True, slots=True)
 class MirrorHealth:
+    """Freshness of one mirror."""
+
     mirror: Mirror
     state: MirrorState
     age_hours: float | None  # since last success; None = never succeeded
     level: int
 
+    def describe(self) -> str:
+        """``name (age)`` for the report."""
+        age = "never synced" if self.age_hours is None else f"{self.age_hours:.0f} h"
+        return f"{self.mirror.name} ({age})"
+
+
+def _hours(now: datetime, since: datetime | None) -> float | None:
+    return (now - since).total_seconds() / SECONDS_PER_HOUR if since else None
+
 
 def assess(config: Config, state: State, now: datetime) -> list[MirrorHealth]:
-    """Stale = no successful sync for N hours. Short upstream outages are tolerated
-    (the last good snapshot is served); a mirror that never synced serves nothing,
-    so it is at least WARNING right away and CRITICAL after stale_critical_hours."""
+    """Freshness of every configured mirror.
+
+    Stale = no successful sync for N hours. Short upstream outages are
+    tolerated (the last good snapshot is served); a mirror that never synced
+    serves nothing, so it is at least WARNING right away and CRITICAL after
+    stale_critical_hours.
+    """
     result = []
     for mirror in config.mirrors:
         st = state.mirrors.get(mirror.name, MirrorState())
-        success = from_iso(st.last_success)
-        reference = success or from_iso(st.first_attempt)
-        age = (now - reference).total_seconds() / 3600 if reference else 0.0
+        success = parse_optional_utc(st.last_success)
+        age = _hours(now, success or parse_optional_utc(st.first_attempt)) or 0.0
         if age >= config.stale_critical_hours:
             level = CRITICAL
         elif success is None or age >= config.stale_warning_hours:
             level = WARNING
         else:
             level = OK
-        result.append(MirrorHealth(mirror, st, (now - success).total_seconds() / 3600 if success else None, level))
+        result.append(MirrorHealth(mirror, st, _hours(now, success), level))
     return result
 
 
@@ -50,12 +95,7 @@ def report(config: Config, state: State, now: datetime) -> tuple[int, str, str]:
     failing = [h for h in health if h.state.last_error]
     parts = [f"{len(health)} mirrors"]
     if bad:
-        parts.append(
-            "stale: "
-            + ", ".join(
-                f"{h.mirror.name} ({'never synced' if h.age_hours is None else f'{h.age_hours:.0f} h'})" for h in bad
-            )
-        )
+        parts.append("stale: " + ", ".join(h.describe() for h in bad))
     if failing:
         parts.append("last attempt failed: " + ", ".join(h.mirror.name for h in failing))
     output = f"REPO {STATE_NAMES[level]} - " + "; ".join(parts)
@@ -64,18 +104,19 @@ def report(config: Config, state: State, now: datetime) -> tuple[int, str, str]:
 
 
 def status_document(config: Config, state: State, now: datetime) -> dict[str, object]:
+    """Content of ``status.json``."""
     return {
-        "generated": iso(now),
+        "generated": format_utc(now),
         "last_run": state.last_run,
         "mirrors": [
             {
                 "name": h.mirror.name,
                 "title": h.mirror.title,
                 "path": f"/{h.mirror.prefix}/",
-                "distribution": h.mirror.distribution,
-                "component": h.mirror.component,
-                "architectures": list(h.mirror.architectures),
-                "upstream": h.mirror.url,
+                "distribution": h.mirror.upstream.distribution,
+                "component": h.mirror.upstream.component,
+                "architectures": list(h.mirror.upstream.architectures),
+                "upstream": h.mirror.upstream.url,
                 "packages": h.state.packages,
                 "last_success": h.state.last_success,
                 "last_attempt": h.state.last_attempt,
@@ -88,95 +129,56 @@ def status_document(config: Config, state: State, now: datetime) -> dict[str, ob
 
 
 def render_status(config: Config, state: State, now: datetime) -> bytes:
+    """``status.json`` as bytes."""
     return (json.dumps(status_document(config, state, now), indent=2) + "\n").encode()
 
 
-_CSS = """
-:root{--bg:#fff;--fg:#1d2433;--muted:#5b6475;--line:#d9dee7;--ok:#1a7f37;--warn:#9a6700;--crit:#cf222e;
---code:#f4f6f9}
-@media (prefers-color-scheme:dark){:root{--bg:#11151c;--fg:#e6e9ef;--muted:#9aa3b2;--line:#2a313c;
---ok:#3fb950;--warn:#d29922;--crit:#f85149;--code:#1a2029}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:960px;margin:0 auto;padding:24px 16px 48px}h1{font-size:1.6rem;margin:0 0 4px}
-h2{font-size:1.15rem;margin:32px 0 8px}p.muted,.muted{color:var(--muted)}
-table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:8px 6px;
-border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600}
-.wrap{overflow-x:auto}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88rem}
-pre{background:var(--code);padding:12px;border-radius:6px;overflow-x:auto}
-.ok{color:var(--ok)}.warning{color:var(--warn)}.critical{color:var(--crit)}
-"""
-
-
-def _t(cs: str, en: str) -> str:
+def _bilingual(cs: str, en: str) -> str:
     return f'<span lang="cs">{html.escape(cs)}</span> / <span lang="en">{html.escape(en)}</span>'
 
 
-def render_index(config: Config, state: State, now: datetime, key_fingerprint: str) -> bytes:
+def _row(base_url: str, health: MirrorHealth) -> str:
     e = html.escape
-    rows = []
-    for h in assess(config, state, now):
-        m, st = h.mirror, h.state
-        status_cls = {OK: "ok", WARNING: "warning", CRITICAL: "critical"}.get(h.level, "warning")
-        rows.append(
-            "<tr>"
-            f"<td><strong>{e(m.title)}</strong><br><code>{e(config.base_url)}/{e(m.prefix)}/</code></td>"
-            f"<td><code>{e(m.distribution)}</code> · {e(m.component)}<br>"
-            f"{e(', '.join(m.architectures))}</td>"
-            f"<td>{st.packages}</td>"
-            f'<td class="{status_cls}">{e(st.last_success or "—")}'
-            f"{' ⚠' if st.last_error else ''}</td>"
-            "</tr>"
-        )
-    host = e(config.base_url.removeprefix("https://"))
-    example = config.mirrors[0] if config.mirrors else None
-    sources = (
-        f"Types: deb\nURIs: {config.base_url}/{example.prefix}/\nSuites: {example.distribution}\n"
-        f"Components: {example.component}\nArchitectures: amd64\n"
-        "Signed-By: /etc/apt/keyrings/repo-mordecai.asc\n"
-        if example
-        else ""
+    m, st, up = health.mirror, health.state, health.mirror.upstream
+    css = LEVEL_CLASSES.get(health.level, "warning")
+    failed = " ⚠" if st.last_error else ""
+    return (
+        "<tr>"
+        f"<td><strong>{e(m.title)}</strong><br><code>{e(base_url)}/{e(m.prefix)}/</code></td>"
+        f"<td><code>{e(up.distribution)}</code> · {e(up.component)}<br>"
+        f"{e(', '.join(up.architectures))}</td>"
+        f"<td>{st.packages}</td>"
+        f'<td class="{css}">{e(st.last_success or "—")}{failed}</td>'
+        "</tr>"
     )
-    page = f"""<!doctype html>
-<html lang="cs"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{e(config.site_title)}</title><meta name="robots" content="noindex"><style>{_CSS}</style></head>
-<body><main>
-<h1>{e(config.site_title)}</h1>
-<p class="muted">{
-        _t(
-            "Zrcadla APT repozitářů. Stahování vyžaduje přístupové údaje.",
-            "APT repository mirrors. Downloads require credentials.",
-        )
-    }</p>
-<p class="muted">{_t("Aktualizováno", "Updated")}: {e(iso(now))}</p>
 
-<h2>{_t("Zrcadla", "Mirrors")}</h2>
-<div class="wrap"><table>
-<thead><tr><th>{_t("Zrcadlo", "Mirror")}</th><th>{_t("Distribuce", "Distribution")}</th>
-<th>{_t("Balíčky", "Packages")}</th><th>{_t("Poslední synchronizace (UTC)", "Last sync (UTC)")}</th></tr></thead>
-<tbody>{"".join(rows)}</tbody></table></div>
-<p class="muted">⚠ {
-        _t(
-            "poslední pokus o stažení ze zdroje selhal, nabízí se poslední úspěšný stav",
-            "the last attempt to fetch from upstream failed; the last good state is served",
-        )
-    }</p>
 
-<h2>{_t("Nastavení klienta", "Client setup")}</h2>
-<p>1. {_t("Klíč repozitáře", "Repository key")}: <a href="/key.asc"><code>/key.asc</code></a>,
-{_t("otisk", "fingerprint")} <code>{e(key_fingerprint)}</code></p>
-<pre>sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL {e(config.base_url)}/key.asc | sudo tee /etc/apt/keyrings/repo-mordecai.asc &gt;/dev/null</pre>
-<p>2. {_t("Přístupové údaje (soubor jen pro root)", "Credentials (root-only file)")}:</p>
-<pre>sudo install -m 0600 /dev/null /etc/apt/auth.conf.d/repo-mordecai.conf
-printf 'machine {
-        host
-    }\\nlogin LOGIN\\npassword TOKEN\\n' | sudo tee /etc/apt/auth.conf.d/repo-mordecai.conf &gt;/dev/null</pre>
-<p>3. {_t("Zdroj (příklad)", "Source (example)")}: <code>/etc/apt/sources.list.d/repo-mordecai-*.sources</code></p>
-<pre>{e(sources)}</pre>
-<p class="muted">{
-        _t("Stav strojově", "Machine-readable status")
-    }: <a href="/status.json"><code>/status.json</code></a></p>
-</main></body></html>
-"""
+def _sources_example(config: Config) -> str:
+    """A deb822 source for the first mirror (empty without mirrors)."""
+    if not config.mirrors:
+        return ""
+    m = config.mirrors[0]
+    return (
+        f"Types: deb\nURIs: {config.base_url}/{m.prefix}/\n"
+        f"Suites: {m.upstream.distribution}\nComponents: {m.upstream.component}\n"
+        f"Architectures: amd64\nSigned-By: {KEYRING_PATH}\n"
+    )
+
+
+def render_index(config: Config, state: State, now: datetime, key_fingerprint: str) -> bytes:
+    """``index.html``: mirrors, their freshness and client setup (Czech and English)."""
+    e = html.escape
+    template = Template(
+        resources.files("repo_sync").joinpath("templates/index.html").read_text(encoding="utf-8")
+    )
+    page = template.substitute(
+        {name: _bilingual(cs, en) for name, (cs, en) in TEXTS.items()},
+        title=e(config.site_title),
+        updated=e(format_utc(now)),
+        rows="".join(_row(config.base_url, h) for h in assess(config, state, now)),
+        fingerprint=e(key_fingerprint),
+        base_url=e(config.base_url),
+        host=e(config.base_url.removeprefix("https://")),
+        sources=e(_sources_example(config)),
+    )
     return page.encode()

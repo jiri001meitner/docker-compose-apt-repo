@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>$title</title>
+<style>
+:root{--bg:#fff;--fg:#1d2433;--muted:#5b6475;--line:#d9dee7;--ok:#1a7f37;--warn:#9a6700;
+--crit:#cf222e;--code:#f4f6f9}
+@media (prefers-color-scheme:dark){:root{--bg:#11151c;--fg:#e6e9ef;--muted:#9aa3b2;
+--line:#2a313c;--ok:#3fb950;--warn:#d29922;--crit:#f85149;--code:#1a2029}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}
+h2{font-size:1.15rem;margin:32px 0 8px}
+.muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:.92rem}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+.wrap{overflow-x:auto}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88rem}
+pre{background:var(--code);padding:12px;border-radius:6px;overflow-x:auto}
+.ok{color:var(--ok)}.warning{color:var(--warn)}.critical{color:var(--crit)}
+</style>
+</head>
+<body><main>
+<h1>$title</h1>
+<p class="muted">$t_intro</p>
+<p class="muted">$t_updated: $updated</p>
+
+<h2>$t_mirrors</h2>
+<div class="wrap"><table>
+<thead><tr><th>$t_mirror</th><th>$t_distribution</th><th>$t_packages</th><th>$t_last_sync</th></tr></thead>
+<tbody>$rows</tbody></table></div>
+<p class="muted">⚠ $t_failed</p>
+
+<h2>$t_client</h2>
+<p>1. $t_key: <a href="/key.asc"><code>/key.asc</code></a>, $t_fingerprint <code>$fingerprint</code></p>
+<pre>sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL $base_url/key.asc | sudo tee /etc/apt/keyrings/repo-mordecai.asc &gt;/dev/null</pre>
+<p>2. $t_credentials:</p>
+<pre>sudo install -m 0600 /dev/null /etc/apt/auth.conf.d/repo-mordecai.conf
+printf 'machine $host\nlogin LOGIN\npassword TOKEN\n' | sudo tee /etc/apt/auth.conf.d/repo-mordecai.conf &gt;/dev/null</pre>
+<p>3. $t_source: <code>/etc/apt/sources.list.d/repo-mordecai-*.sources</code></p>
+<pre>$sources</pre>
+<p class="muted">$t_status: <a href="/status.json"><code>/status.json</code></a></p>
+</main></body>
+</html>

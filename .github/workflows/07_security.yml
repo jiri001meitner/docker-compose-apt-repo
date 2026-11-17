@@ -1,0 +1,38 @@
+name: Security (secrets, forbidden files)
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the whole history, not only the last commit
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  forbidden-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No configuration, keys, databases, sockets or caches tracked
+        run: git ls-files -z | scripts/forbidden_files.sh
+      - name: Pre-commit hook works
+        run: |
+          git config user.email ci@example.invalid
+          git config user.name ci
+          git config core.hooksPath .githooks
+          printf 'X=1\n' > .env
+          git add -f .env
+          if git commit -qm "must be refused"; then
+            echo "::error::the hook accepted .env"
+            exit 1
+          fi
+          git rm -q --cached .env

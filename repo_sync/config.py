@@ -16,38 +16,98 @@ ARCH_RE = re.compile(r"^[a-z0-9-]+$")
 FPR_RE = re.compile(r"^[0-9A-F]{40}$")
 # Public catalogue files live at the root of the publish directory.
 RESERVED_PREFIXES = frozenset({"index.html", "status.json", "key.asc", "favicon.ico", "robots.txt"})
+MIRROR_KEYS = frozenset(
+    {
+        "name",
+        "title",
+        "url",
+        "distribution",
+        "component",
+        "architectures",
+        "key_file",
+        "prefix",
+        "filter",
+        "filter_with_deps",
+    }
+)
+CONFIG_KEYS = frozenset(
+    {
+        "gpg_key",
+        "origin",
+        "label",
+        "keep_snapshots",
+        "stale_warning_hours",
+        "stale_critical_hours",
+        "site_title",
+        "base_url",
+        "mirrors",
+    }
+)
 
 
 class ConfigError(ValueError):
-    pass
+    """The configuration is invalid; nothing is synchronised."""
 
 
 @dataclass(frozen=True, slots=True)
-class Mirror:
-    name: str
-    title: str
+class Upstream:
+    """What is mirrored: one distribution and component of an upstream repository.
+
+    The same distribution, component and architectures are published.
+    """
+
     url: str
     distribution: str
     component: str
     architectures: tuple[str, ...]
-    key_file: str
-    prefix: str
-    filter: str | None
-    filter_with_deps: bool
+    filter: str | None = None
+    filter_with_deps: bool = False
 
-    def mirror_hash(self) -> str:
-        """Changes when the aptly mirror must be recreated."""
+    def identity(self) -> str:
+        """Changes exactly when the aptly mirror must be recreated."""
         material = json.dumps(
-            [self.url, self.distribution, self.component, self.architectures, self.filter, self.filter_with_deps]
+            [
+                self.url,
+                self.distribution,
+                self.component,
+                self.architectures,
+                self.filter,
+                self.filter_with_deps,
+            ]
         )
         return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True, slots=True)
-class Config:
+class Mirror:
+    """One mirrored repository and where it is published."""
+
+    name: str
+    title: str
+    upstream: Upstream
+    key_file: str
+    prefix: str
+
+    @property
+    def target(self) -> tuple[str, str]:
+        """(prefix, distribution) of the publication."""
+        return self.prefix, self.upstream.distribution
+
+
+@dataclass(frozen=True, slots=True)
+class Signing:
+    """Repository signing key and the Release file fields."""
+
     gpg_key: str
     origin: str
     label: str
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    """The whole ``mirrors.json``."""
+
+    signing: Signing
     keep_snapshots: int
     stale_warning_hours: int
     stale_critical_hours: int
@@ -75,7 +135,10 @@ def _str_list(raw: dict[str, Any], key: str, ctx: str, pattern: re.Pattern[str])
     if not isinstance(value, list) or not value:
         raise ConfigError(f"{ctx}: '{key}' must be a non-empty list")
     for item in value:
-        _req(isinstance(item, str) and pattern.fullmatch(item) is not None, f"{ctx}: invalid {key} item {item!r}")
+        _req(
+            isinstance(item, str) and pattern.fullmatch(item) is not None,
+            f"{ctx}: invalid {key} item {item!r}",
+        )
     return tuple(value)
 
 
@@ -86,80 +149,55 @@ def _int(raw: dict[str, Any], key: str, default: int, minimum: int) -> int:
     return value
 
 
-def _mirror(raw: Any, index: int) -> Mirror:
-    ctx = f"mirrors[{index}]"
-    _req(isinstance(raw, dict), f"{ctx}: not an object")
-    allowed = {
-        "name",
-        "title",
-        "url",
-        "distribution",
-        "component",
-        "architectures",
-        "key_file",
-        "prefix",
-        "filter",
-        "filter_with_deps",
-    }
-    _req(set(raw) <= allowed, f"{ctx}: unknown keys {sorted(set(raw) - allowed)}")
-    name = _str(raw, "name", ctx, NAME_RE)
+def _upstream(raw: dict[str, Any], ctx: str) -> Upstream:
     url = _str(raw, "url", ctx)
     _req(
         url.startswith(("https://", "http://")) and not any(c.isspace() for c in url),
         f"{ctx}: url must be http(s) without spaces",
     )
-    prefix = _str(raw, "prefix", ctx)
-    segments = prefix.split("/")
-    _req(all(PREFIX_SEGMENT_RE.fullmatch(s) for s in segments), f"{ctx}: invalid prefix {prefix!r}")
-    _req(segments[0] not in RESERVED_PREFIXES, f"{ctx}: prefix {prefix!r} is reserved")
-    key_file = _str(raw, "key_file", ctx)
-    _req(key_file.startswith("/"), f"{ctx}: key_file must be absolute")
     flt = raw.get("filter")
-    _req(flt is None or (isinstance(flt, str) and flt.strip() != ""), f"{ctx}: filter must be a string or null")
+    _req(
+        flt is None or (isinstance(flt, str) and flt.strip() != ""),
+        f"{ctx}: filter must be a string or null",
+    )
     fwd = raw.get("filter_with_deps", False)
     _req(isinstance(fwd, bool), f"{ctx}: filter_with_deps must be boolean")
-    return Mirror(
-        name=name,
-        title=_str(raw, "title", ctx),
+    return Upstream(
         url=url,
         distribution=_str(raw, "distribution", ctx, DIST_RE),
         # One component per mirror: aptly merges several into one snapshot,
         # and every upstream here (Caddy, PPAs) has only `main`.
         component=_str(raw, "component", ctx, DIST_RE),
         architectures=_str_list(raw, "architectures", ctx, ARCH_RE),
-        key_file=key_file,
-        prefix=prefix,
         filter=flt,
         filter_with_deps=fwd,
     )
 
 
-def parse_config(data: str) -> Config:
-    try:
-        raw = json.loads(data)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"not valid JSON: {exc}") from exc
-    _req(isinstance(raw, dict), "config is not an object")
-    allowed = {
-        "gpg_key",
-        "origin",
-        "label",
-        "keep_snapshots",
-        "stale_warning_hours",
-        "stale_critical_hours",
-        "site_title",
-        "base_url",
-        "mirrors",
-    }
-    _req(set(raw) <= allowed, f"unknown keys {sorted(set(raw) - allowed)}")
-    mirrors_raw = raw.get("mirrors")
-    if not isinstance(mirrors_raw, list):
-        raise ConfigError("'mirrors' must be a list")
-    mirrors = tuple(_mirror(m, i) for i, m in enumerate(mirrors_raw))
+def _mirror(raw: Any, index: int) -> Mirror:
+    ctx = f"mirrors[{index}]"
+    _req(isinstance(raw, dict), f"{ctx}: not an object")
+    _req(set(raw) <= MIRROR_KEYS, f"{ctx}: unknown keys {sorted(set(raw) - MIRROR_KEYS)}")
+    prefix = _str(raw, "prefix", ctx)
+    segments = prefix.split("/")
+    _req(all(PREFIX_SEGMENT_RE.fullmatch(s) for s in segments), f"{ctx}: invalid prefix {prefix!r}")
+    _req(segments[0] not in RESERVED_PREFIXES, f"{ctx}: prefix {prefix!r} is reserved")
+    key_file = _str(raw, "key_file", ctx)
+    _req(key_file.startswith("/"), f"{ctx}: key_file must be absolute")
+    return Mirror(
+        name=_str(raw, "name", ctx, NAME_RE),
+        title=_str(raw, "title", ctx),
+        upstream=_upstream(raw, ctx),
+        key_file=key_file,
+        prefix=prefix,
+    )
+
+
+def _check_layout(mirrors: tuple[Mirror, ...]) -> None:
     names = [m.name for m in mirrors]
     _req(len(names) == len(set(names)), "mirror names must be unique")
-    published = [(m.prefix, m.distribution) for m in mirrors]
-    _req(len(published) == len(set(published)), "prefix + distribution must be unique")
+    targets = [m.target for m in mirrors]
+    _req(len(targets) == len(set(targets)), "prefix + distribution must be unique")
     # A prefix nested in another (ppa vs ppa/x) would put one repository's
     # tree inside another's, and an access scope for the outer one would
     # silently cover the inner one.
@@ -167,15 +205,35 @@ def parse_config(data: str) -> Config:
     for outer in prefixes:
         for inner in prefixes:
             _req(not inner.startswith(outer + "/"), f"prefix {inner!r} is nested in {outer!r}")
+
+
+def parse_config(data: str) -> Config:
+    """Parse and validate ``mirrors.json``; any defect raises ConfigError."""
+    try:
+        raw = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"not valid JSON: {exc}") from exc
+    _req(isinstance(raw, dict), "config is not an object")
+    _req(set(raw) <= CONFIG_KEYS, f"unknown keys {sorted(set(raw) - CONFIG_KEYS)}")
+    mirrors_raw = raw.get("mirrors")
+    if not isinstance(mirrors_raw, list):
+        raise ConfigError("'mirrors' must be a list")
+    mirrors = tuple(_mirror(m, i) for i, m in enumerate(mirrors_raw))
+    _check_layout(mirrors)
     warn = _int(raw, "stale_warning_hours", 48, 1)
     crit = _int(raw, "stale_critical_hours", 168, 1)
     _req(crit >= warn, "stale_critical_hours must be >= stale_warning_hours")
     base_url = _str(raw, "base_url", "config")
-    _req(base_url.startswith("https://") and not base_url.endswith("/"), "base_url must be https:// without '/'")
+    _req(
+        base_url.startswith("https://") and not base_url.endswith("/"),
+        "base_url must be https:// without '/'",
+    )
     return Config(
-        gpg_key=_str(raw, "gpg_key", "config", FPR_RE),
-        origin=_str(raw, "origin", "config"),
-        label=_str(raw, "label", "config"),
+        signing=Signing(
+            gpg_key=_str(raw, "gpg_key", "config", FPR_RE),
+            origin=_str(raw, "origin", "config"),
+            label=_str(raw, "label", "config"),
+        ),
         keep_snapshots=_int(raw, "keep_snapshots", 3, 1),
         stale_warning_hours=warn,
         stale_critical_hours=crit,
@@ -186,4 +244,5 @@ def parse_config(data: str) -> Config:
 
 
 def load_config(path: str) -> Config:
+    """Read and validate the configuration file."""
     return parse_config(Path(path).read_text(encoding="utf-8"))

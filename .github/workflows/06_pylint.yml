@@ -1,0 +1,28 @@
+name: Pylint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pylint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install pylint
+        run: python -m pip install --upgrade pylint
+      - name: pylint (every Python file, 10/10, no exceptions)
+        # Any message makes pylint exit non-zero; nothing is disabled.
+        run: pylint $(git ls-files '*.py')
+      - name: No suppression comments
+        run: |
+          if git grep -nE 'pylint: *disable|type: *ignore' -- '*.py'; then
+            echo "::error::suppression comments are not allowed"
+            exit 1
+          fi

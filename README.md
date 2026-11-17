@@ -174,12 +174,23 @@ Signed-By: /etc/apt/keyrings/repo-mordecai.asc
 
 ## Development and tests
 
+Layout, data flow and trust boundaries: [ARCHITECTURE.md](ARCHITECTURE.md).
+Rules for contributors and agents (in Czech): [AGENTS.md](AGENTS.md);
+how to report a vulnerability: [SECURITY.md](SECURITY.md). Operational facts
+are in `knowledge/`, step-by-step procedures in `skills/`.
+
 ```bash
-python -m pytest -q && ruff check . && ruff format --check . && mypy   # unit tests, strict typing
+git config core.hooksPath .githooks       # once per clone: refuses secrets and local files
+
+pylint $(git ls-files '*.py')             # 10.00/10 on every file, nothing disabled
+ruff check . && ruff format --check . && mypy && python -m pytest -q
 docker build -f docker/aptly.Dockerfile -t apt-repo/aptly:test . \
   && docker build -t apt-repo/aptly-it:test tests/integration \
-  && docker run --rm --network none apt-repo/aptly-it:test         # aptly + gpg + apt, offline
-tests/e2e/run.sh                                                    # compose + real Caddy, curl matrix
+  && docker run --rm --network none apt-repo/aptly-it:test   # aptly + gpg + apt, offline
+tests/e2e/run.sh                                              # compose + real Caddy, curl matrix
 ```
 
-CI runs all of them plus ShellCheck and `docker compose config`.
+CI runs all of them plus ShellCheck, `docker compose config` with a build of
+every profile, and a security workflow: gitleaks over the whole history and
+`scripts/forbidden_files.sh` over the tracked files (no `.env`, mirror
+configuration, keys, databases, sockets or caches).

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Refuses commits with forbidden files or secrets in the staged diff.
+# Enable in every clone:  git config core.hooksPath .githooks
+set -Eeuo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+check_names() {
+   git diff --cached --name-only -z --diff-filter=ACMR | "${repo_root}/scripts/forbidden_files.sh"
+}
+
+check_content() {
+   local added errors=0
+   added="$(git diff --cached -U0 --diff-filter=ACMR | grep -E '^\+' | grep -vE '^\+\+\+ ' || true)"
+   local -A patterns=(
+      ["private key block"]='-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY( BLOCK)?-----'
+      ["AWS access key"]='AKIA[0-9A-Z]{16}'
+      ["GitHub token"]='(ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{60,}'
+      ["Basic credentials in a URL"]='https?://[^/[:space:]:@]+:[^/[:space:]@]+@'
+   )
+   local name
+   for name in "${!patterns[@]}"; do
+      if grep -qE -e "${patterns[${name}]}" <<<"${added}"; then
+         printf 'staged change contains a %s\n' "${name}" >&2
+         errors=1
+      fi
+   done
+   return "${errors}"
+}
+
+main() {
+   local failed=0
+   check_names || failed=1
+   check_content || failed=1
+   if command -v gitleaks >/dev/null 2>&1; then
+      gitleaks git --staged --no-banner --redact "${repo_root}" || failed=1
+   fi
+   if ((failed)); then
+      printf '\ncommit refused: remove the data above from the index (git restore --staged <file>)\n' >&2
+      return 1
+   fi
+}
+
+main "$@"

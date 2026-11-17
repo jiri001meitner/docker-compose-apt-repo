@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
+
+from repo_common.timeutil import format_utc, parse_utc
 
 EXPORT_VERSION = 1
 
@@ -23,6 +25,8 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_RE = re.compile(r"^[\x21-\x39\x3b-\x7e]{32,256}$")
 # Scope segments: what aptly prefixes and distributions may contain.
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9._+~-]+$")
+ENTRY_KEYS = frozenset({"account", "sha256", "scopes", "valid_until", "blocked"})
+TOP_LEVEL_KEYS = frozenset({"version", "generated", "tokens"})
 
 
 class ExportError(ValueError):
@@ -30,10 +34,12 @@ class ExportError(ValueError):
 
 
 def valid_name(value: str) -> bool:
+    """True for a valid login or account id."""
     return NAME_RE.fullmatch(value) is not None
 
 
 def valid_token(value: str) -> bool:
+    """True for a token that can be sent in a Basic header (no space, no colon)."""
     return TOKEN_RE.fullmatch(value) is not None
 
 
@@ -54,20 +60,10 @@ def normalize_scope(scope: str) -> str:
     return "/" + "/".join(segments) + "/"
 
 
-def parse_utc(value: str) -> datetime:
-    """Parse an ISO 8601 timestamp; naive values are rejected."""
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        raise ValueError(f"timestamp without timezone: {value!r}")
-    return parsed.astimezone(UTC)
-
-
-def format_utc(value: datetime) -> str:
-    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 @dataclass(frozen=True, slots=True)
 class TokenEntry:
+    """One active token as the auth service sees it."""
+
     login: str
     account: str
     sha256: str
@@ -78,6 +74,8 @@ class TokenEntry:
 
 @dataclass(frozen=True, slots=True)
 class Export:
+    """The whole client list, keyed by login."""
+
     generated: datetime
     tokens: dict[str, TokenEntry]
 
@@ -87,20 +85,10 @@ def _require(cond: bool, message: str) -> None:
         raise ExportError(message)
 
 
-def _parse_entry(login: str, raw: Any) -> TokenEntry:
-    _require(valid_name(login), f"invalid login {login!r}")
-    _require(isinstance(raw, dict), f"{login}: entry is not an object")
-    expected = {"account", "sha256", "scopes", "valid_until", "blocked"}
-    _require(set(raw) == expected, f"{login}: unexpected keys {sorted(set(raw) ^ expected)}")
-
-    account = raw["account"]
-    _require(isinstance(account, str) and valid_name(account), f"{login}: invalid account")
-    digest = raw["sha256"]
-    _require(isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None, f"{login}: invalid sha256")
-    scopes_raw = raw["scopes"]
-    _require(isinstance(scopes_raw, list) and len(scopes_raw) > 0, f"{login}: scopes must be a non-empty list")
+def _parse_scopes(login: str, raw: Any) -> tuple[str, ...]:
+    _require(isinstance(raw, list) and len(raw) > 0, f"{login}: scopes must be a non-empty list")
     scopes: list[str] = []
-    for scope in scopes_raw:
+    for scope in raw:
         _require(isinstance(scope, str), f"{login}: scope is not a string")
         try:
             canonical = normalize_scope(scope)
@@ -108,18 +96,36 @@ def _parse_entry(login: str, raw: Any) -> TokenEntry:
             raise ExportError(f"{login}: {exc}") from exc
         _require(canonical == scope, f"{login}: scope {scope!r} is not canonical")
         scopes.append(scope)
-    valid_until_raw = raw["valid_until"]
-    valid_until: datetime | None = None
-    if valid_until_raw is not None:
-        _require(isinstance(valid_until_raw, str), f"{login}: valid_until is not a string")
-        try:
-            valid_until = parse_utc(valid_until_raw)
-        except ValueError as exc:
-            raise ExportError(f"{login}: {exc}") from exc
-    blocked = raw["blocked"]
+    return tuple(scopes)
+
+
+def _parse_timestamp(context: str, raw: Any) -> datetime:
+    _require(isinstance(raw, str), f"{context}: timestamp is not a string")
+    try:
+        return parse_utc(raw)
+    except ValueError as exc:
+        raise ExportError(f"{context}: {exc}") from exc
+
+
+def _parse_entry(login: str, raw: Any) -> TokenEntry:
+    _require(valid_name(login), f"invalid login {login!r}")
+    _require(isinstance(raw, dict), f"{login}: entry is not an object")
+    _require(set(raw) == ENTRY_KEYS, f"{login}: unexpected keys {sorted(set(raw) ^ ENTRY_KEYS)}")
+    account, digest, blocked = raw["account"], raw["sha256"], raw["blocked"]
+    _require(isinstance(account, str) and valid_name(account), f"{login}: invalid account")
+    _require(
+        isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None,
+        f"{login}: invalid sha256",
+    )
     _require(isinstance(blocked, bool), f"{login}: blocked is not a boolean")
+    valid_until = raw["valid_until"]
     return TokenEntry(
-        login=login, account=account, sha256=digest, scopes=tuple(scopes), valid_until=valid_until, blocked=blocked
+        login=login,
+        account=account,
+        sha256=digest,
+        scopes=_parse_scopes(login, raw["scopes"]),
+        valid_until=None if valid_until is None else _parse_timestamp(login, valid_until),
+        blocked=blocked,
     )
 
 
@@ -130,21 +136,19 @@ def parse_export(data: bytes) -> Export:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ExportError(f"not valid JSON: {exc}") from exc
     _require(isinstance(raw, dict), "export is not an object")
-    _require(raw.get("version") == EXPORT_VERSION, f"unsupported export version {raw.get('version')!r}")
-    _require(set(raw) == {"version", "generated", "tokens"}, "unexpected top-level keys")
-    generated_raw = raw["generated"]
-    _require(isinstance(generated_raw, str), "generated is not a string")
-    try:
-        generated = parse_utc(generated_raw)
-    except ValueError as exc:
-        raise ExportError(str(exc)) from exc
+    version = raw.get("version")
+    _require(version == EXPORT_VERSION, f"unsupported export version {version!r}")
+    _require(set(raw) == TOP_LEVEL_KEYS, "unexpected top-level keys")
     tokens_raw = raw["tokens"]
     _require(isinstance(tokens_raw, dict), "tokens is not an object")
-    tokens = {login: _parse_entry(login, entry) for login, entry in tokens_raw.items()}
-    return Export(generated=generated, tokens=tokens)
+    return Export(
+        generated=_parse_timestamp("generated", raw["generated"]),
+        tokens={login: _parse_entry(login, entry) for login, entry in tokens_raw.items()},
+    )
 
 
 def render_export(generated: datetime, tokens: list[TokenEntry]) -> bytes:
+    """Serialise the client list (sorted, stable output)."""
     payload = {
         "version": EXPORT_VERSION,
         "generated": format_utc(generated),
