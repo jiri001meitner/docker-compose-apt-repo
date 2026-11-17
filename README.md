@@ -99,8 +99,12 @@ One run:
 
 1. `aptly mirror update`, verifying the upstream signature with the mirror's
    key only (a tampered upstream is rejected);
-2. snapshot `<mirror>-<UTC timestamp>`; when identical to the published one it
-   is dropped, otherwise the publication is switched. Indexes are published
+2. a full snapshot `<mirror>-<UTC timestamp>-src`, and from it (`snapshot
+   merge -latest`) the snapshot `<mirror>-<UTC timestamp>` with **only the
+   newest version of each package** — older versions lack security fixes.
+   The pair lives and is dropped together (aptly needs the source). When
+   identical to the published one it is dropped, otherwise the publication
+   is switched. Indexes are published
    with `Acquire-By-Hash`, so a client updating during the switch never
    mixes old and new indexes;
 3. published Release files are signed with the repository key, which is
@@ -118,6 +122,11 @@ the original layout), with a short gap for that distribution. Changing the
 prefix moves the publication. A mirror removed from the config (or renamed)
 is dropped only after nothing configured needs its publication, so a
 rename while the upstream is down keeps the old content served.
+
+The aptly mirror still downloads every version the upstream lists (once;
+later runs fetch only new files), only the publication is reduced. To save
+the download of a large upstream with many old versions, add a `filter`
+such as `caddy (>= 2.11)`.
 
 Only the listed architectures are mirrored (`amd64` also brings `all`).
 Clients with a foreign architecture (`i386`) must set `Architectures: amd64`

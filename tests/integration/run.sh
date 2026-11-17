@@ -110,7 +110,7 @@ PY
 
 # --- run 1 ------------------------------------------------------------------
 repo_sync sync 2>"${work}/sync1.log" || { cat "${work}/sync1.log"; fail "sync 1 exit code"; }
-[[ -f "${pub}/ppa/fixture/dists/resolute/InRelease" ]] || fail "fixture not published"
+[[ -f "${pub}/ppa/fixture/dists/resolute/InRelease" ]] || { cat "${work}/sync1.log"; fail "fixture not published"; }
 pass "fixture published under nested prefix"
 [[ ! -e "${pub}/dead" ]] || fail "dead mirror must not be published"
 pass "unreachable upstream does not publish"
@@ -139,7 +139,7 @@ pass "Release signed by repository key, origin set"
 for f in index.html status.json key.asc; do [[ -s "${site}/${f}" ]] || fail "missing ${f}"; done
 [[ -z "$(find "${pub}" -maxdepth 1 -type f)" ]] || fail "catalogue files inside the repository root"
 grep -q 'Test &lt;repo&gt;' "${site}/index.html" || fail "title not escaped"
-python3 - "${site}/status.json" <<'PY' || fail "status.json content"
+python3 - "${site}/status.json" <<'PY' || { cat "${work}/sync1.log"; fail "status.json content"; }
 import json, sys
 s = {m["name"]: m for m in json.load(open(sys.argv[1]))["mirrors"]}
 assert s["fixture"]["packages"] == 2 and not s["fixture"]["last_attempt_failed"], s["fixture"]
@@ -178,6 +178,10 @@ sleep 1
 repo_sync sync 2>"${work}/sync3.log" || fail "sync 3 exit code"
 grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "1.1 not published"
 pass "new upstream version switched in"
+grep -q '/hello_1.0_amd64.deb$' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" \
+   && fail "old version 1.0 still published (upstream lists 1.0 and 1.1)"
+[[ -z "$(find "${pub}/ppa/fixture/pool" -name 'hello_1.0_*')" ]] || fail "old version in the published pool"
+pass "only the latest version is published"
 
 # --- run 4: upstream breaks (bad signature) keeps last good ------------------
 echo tampered >> "${up}/dists/resolute/Release"
@@ -221,7 +225,11 @@ sleep 1
 repo_sync sync 2>"${work}/sync7b.log" || fail "sync 7b exit code"
 grep -q 'Version: 1.1' "${pub}/ppa/moved/dists/resolute/main/binary-amd64/Packages" || fail "successor not published"
 grep -q 'mirror fixture removed from config' "${work}/sync7b.log" "${work}/sync7.log" || fail "old mirror not dropped"
-pass "successor took over, old mirror dropped"
+printf '{"rootDir": "%s"}\n' "${root}" > "${work}/aptly-list.conf"
+leftover="$(setpriv --reuid=10200 --regid=10200 --clear-groups env HOME="${home}" \
+   aptly -config="${work}/aptly-list.conf" snapshot list -raw | grep '^fixture-' || true)"
+[[ -z "${leftover}" ]] || fail "snapshots of the removed mirror left: ${leftover}"
+pass "successor took over, old mirror and all its snapshots (incl. sources) dropped"
 
 # --- concurrent run is refused ------------------------------------------------
 exec 9>"${root}/.repo-sync.lock"

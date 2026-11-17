@@ -16,9 +16,14 @@ from .config import Mirror, Signing
 
 log = logging.getLogger(__name__)
 
-# <mirror>-<UTC timestamp>[-<n>]; the suffix only when two runs fall into the
-# same second. The mirror name may contain dashes, the timestamp anchors it.
-SNAPSHOT_RE = re.compile(r"^(?P<mirror>[a-z0-9][a-z0-9-]*?)-(?P<ts>\d{8}T\d{6}Z)(?:-\d+)?$")
+# <mirror>-<UTC timestamp>[-<n>][-src]; <n> only when two runs fall into the
+# same second, -src for the full snapshot of the mirror that the published
+# (latest versions only) snapshot is made from. The mirror name may contain
+# dashes, the timestamp anchors it.
+SOURCE_SUFFIX = "-src"
+SNAPSHOT_RE = re.compile(
+    r"^(?P<mirror>[a-z0-9][a-z0-9-]*?)-(?P<ts>\d{8}T\d{6}Z)(?:-\d+)?(?P<source>-src)?$"
+)
 
 APTLY = "/usr/bin/aptly"
 DEFAULT_TIMEOUT = 3600
@@ -31,6 +36,12 @@ def snapshot_owner(snapshot: str) -> str | None:
     """Name of the mirror a repo-sync snapshot belongs to, None for foreign ones."""
     match = SNAPSHOT_RE.match(snapshot)
     return match.group("mirror") if match else None
+
+
+def is_source_snapshot(snapshot: str) -> bool:
+    """True for the intermediate full snapshot a published one is made from."""
+    match = SNAPSHOT_RE.match(snapshot)
+    return bool(match and match.group("source"))
 
 
 class AptlyError(RuntimeError):
@@ -152,6 +163,10 @@ class Aptly:
     def snapshot_create(self, name: str, mirror: str) -> None:
         """Snapshot the current content of a mirror."""
         self.run("snapshot", "create", name, "from", "mirror", mirror)
+
+    def snapshot_latest(self, name: str, source: str) -> None:
+        """New snapshot with only the newest version of each package in ``source``."""
+        self.run("snapshot", "merge", "-latest", name, source)
 
     def snapshot_drop(self, name: str) -> None:
         """Delete a snapshot (aptly refuses a published one)."""

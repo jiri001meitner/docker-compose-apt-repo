@@ -23,7 +23,7 @@ from typing import Any, Protocol
 from repo_common.fsio import atomic_write, exclusive_lock
 from repo_common.timeutil import format_utc, utcnow
 
-from .aptly import AptlyError, Publication, snapshot_owner
+from .aptly import SOURCE_SUFFIX, AptlyError, Publication, is_source_snapshot, snapshot_owner
 from .config import Config, Mirror
 from .gpg import dearmor
 
@@ -64,6 +64,9 @@ class AptlyOps(Protocol):
 
     def snapshot_create(self, name: str, mirror: str) -> None:
         """Snapshot a mirror."""
+
+    def snapshot_latest(self, name: str, source: str) -> None:
+        """Snapshot of the newest versions in ``source``."""
 
     def snapshot_drop(self, name: str) -> None:
         """Delete a snapshot."""
@@ -223,7 +226,7 @@ class Syncer:
         base = f"{mirror_name}-{self.started.strftime('%Y%m%dT%H%M%SZ')}"
         existing = set(self.aptly.snapshots())
         name, n = base, 0
-        while name in existing:
+        while name in existing or name + SOURCE_SUFFIX in existing:
             n += 1
             name = f"{base}-{n}"
         return name
@@ -267,7 +270,11 @@ class Syncer:
     ) -> None:
         self._ensure_mirror(mirror, st, mirrors)
         new_snapshot = self._snapshot_name(mirror.name)
-        self.aptly.snapshot_create(new_snapshot, mirror.name)
+        # Only the newest version of each package is published: older ones
+        # lack security fixes, and nobody uses a PPA for an old version.
+        source = new_snapshot + SOURCE_SUFFIX
+        self.aptly.snapshot_create(source, mirror.name)
+        self.aptly.snapshot_latest(new_snapshot, source)
         current = pubs.get(mirror.target)
         if (
             current is not None
@@ -276,7 +283,7 @@ class Syncer:
             and self.aptly.snapshots_identical(current.snapshot, new_snapshot)
         ):
             log.info("mirror %s: no change", mirror.name)
-            self.aptly.snapshot_drop(new_snapshot)
+            self._drop_with_source(new_snapshot)
             published = current.snapshot
         else:
             self._publish(mirror, new_snapshot, current)
@@ -297,18 +304,35 @@ class Syncer:
                 self.aptly.publish_drop(*key)
                 del pubs[key]
 
+    def _drop_with_source(self, snapshot: str) -> None:
+        """Drop a snapshot, then the source snapshot it was merged from (if any).
+
+        aptly refuses to drop a source while a snapshot made from it exists,
+        and ``snapshot show`` of that snapshot needs the source, so both live
+        and go together.
+        """
+        self.aptly.snapshot_drop(snapshot)
+        source = snapshot + SOURCE_SUFFIX
+        if source in self.aptly.snapshots():
+            self.aptly.snapshot_drop(source)
+
     def _drop_old_snapshots(self, mirror_name: str, protected: set[str]) -> None:
-        """Keep published snapshots plus the newest keep_snapshots - 1 others (rollback)."""
+        """Keep published snapshots plus the newest keep_snapshots - 1 others (rollback).
+
+        A source snapshot without its merged snapshot (a run interrupted
+        between the two steps) is dropped.
+        """
+        own = [s for s in self.aptly.snapshots() if snapshot_owner(s) == mirror_name]
+        orphans = [
+            s for s in own if is_source_snapshot(s) and s.removesuffix(SOURCE_SUFFIX) not in own
+        ]
         others = sorted(
-            (
-                s
-                for s in self.aptly.snapshots()
-                if snapshot_owner(s) == mirror_name and s not in protected
-            ),
-            reverse=True,
+            (s for s in own if s not in protected and not is_source_snapshot(s)), reverse=True
         )
-        for snap in others[self.config.keep_snapshots - 1 :]:
+        for snap in orphans:
             self.aptly.snapshot_drop(snap)
+        for snap in others[self.config.keep_snapshots - 1 :]:
+            self._drop_with_source(snap)
 
     def _prune_removed(self, pubs: Publications) -> None:
         """Drop what belongs to mirrors no longer in the config.
@@ -343,6 +367,12 @@ class Syncer:
 
     def _prune_snapshot(self, snap: str, pubs: Publications, targets: set[tuple[str, str]]) -> None:
         """Drop a removed mirror's snapshot and its publications, unless still needed."""
+        if is_source_snapshot(snap):
+            # Goes with its merged snapshot; only an orphan is dropped here.
+            current = self.aptly.snapshots()
+            if snap in current and snap.removesuffix(SOURCE_SUFFIX) not in current:
+                self.aptly.snapshot_drop(snap)
+            return
         places = [key for key, pub in pubs.items() if pub.snapshot == snap]
         if any(key in targets for key in places):
             log.info("keeping %s: still served until its successor publishes", snap)
@@ -351,4 +381,4 @@ class Syncer:
             log.warning("removed mirror %s: dropping publication %s/%s", snapshot_owner(snap), *key)
             self.aptly.publish_drop(*key)
             del pubs[key]
-        self.aptly.snapshot_drop(snap)
+        self._drop_with_source(snap)

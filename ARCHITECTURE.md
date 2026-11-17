@@ -75,6 +75,9 @@ All containers are read-only, drop all capabilities, run with
   authentication path, nothing to pin or audit.
 - **One component per mirror**: aptly would merge several components into
   one snapshot.
+- **Only the newest version of each package is published** (`snapshot merge
+  -latest`): older versions lack security fixes and a mirror of a PPA is
+  used for the newest version.
 - **Acquire-By-Hash** on every publication; `publish switch` keeps the
   original layout, so a layout change publishes again.
 - **Floating base images** (`python:3-slim`, `ubuntu:26.04`), rebuilt with

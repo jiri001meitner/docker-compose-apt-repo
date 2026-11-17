@@ -110,12 +110,20 @@ class FakeAptly:
         _check(name not in self.snaps, f"duplicate snapshot {name}")
         self.snaps[name] = self.mirror[mirror].content
 
+    def snapshot_latest(self, name: str, source: str) -> None:
+        """Copy the source (the fake has one version per snapshot)."""
+        _check(name not in self.snaps, f"duplicate snapshot {name}")
+        self.calls.append(("latest", name, source))
+        self.snaps[name] = self.snaps[source]
+
     def snapshot_drop(self, name: str) -> None:
         """Delete a snapshot; a published one fails like in aptly."""
         if name in self.fail_drop:
             raise AptlyError(["snapshot", "drop"], 1, "ERROR: snapshot is published")
         published = {p.snapshot for p in self.pub.values()}
         _check(name not in published, f"dropping published snapshot {name}")
+        merged = name.removesuffix("-src")
+        _check(merged == name or merged not in self.snaps, f"{name} is the source of {merged}")
         self.calls.append(("snap_drop", name))
         del self.snaps[name]
 

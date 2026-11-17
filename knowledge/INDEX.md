@@ -10,3 +10,4 @@ trefené soubory. Postupy patří do `skills/`.
 | [aptly-verze-ubuntu.md](aptly-verze-ubuntu.md) | proč `ubuntu:26.04` (aptly 1.6), formát `publish list -json`, timeout `mirror update` |
 | [gpg-dearmor-binarni-vstup.md](gpg-dearmor-binarni-vstup.md) | `gpg --dearmor` na binárním klíči uspěje a zapíše nesmysl |
 | [caddy-cesta-forward-auth.md](caddy-cesta-forward-auth.md) | Caddy čistí cestu před forward_auth, `%zz` a `%2F` |
+| [aptly-jen-posledni-verze.md](aptly-jen-posledni-verze.md) | publikuje se jen nejnovější verze (`snapshot merge -latest`), zdrojový snapshot musí žít se sloučeným |

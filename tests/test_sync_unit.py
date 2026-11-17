@@ -13,7 +13,7 @@ from unittest import mock
 
 from repo_sync import gpg
 from repo_sync import sync as sync_mod
-from repo_sync.aptly import AptlyError, Publication
+from repo_sync.aptly import AptlyError, Publication, is_source_snapshot, snapshot_owner
 from repo_sync.config import parse_config
 from repo_sync.sync import STATE_FILE, State, Syncer
 
@@ -49,8 +49,16 @@ class SyncCase(unittest.TestCase):
         return self.aptly.pub[target].snapshot
 
     def snapshots_of(self, mirror: str) -> list[str]:
-        """Snapshots of one mirror, oldest first."""
-        return [s for s in self.aptly.snaps if s.startswith(f"{mirror}-")]
+        """Published-type snapshots of one mirror (no -src sources), oldest first."""
+        return [
+            s for s in self.aptly.snaps if s.startswith(f"{mirror}-") and not s.endswith("-src")
+        ]
+
+    def assert_sources_paired(self) -> None:
+        """Every snapshot has its source and no source is left without one."""
+        names = set(self.aptly.snaps)
+        merged = {s for s in names if not s.endswith("-src")}
+        self.assertEqual({s + "-src" for s in merged}, names - merged)
 
 
 class PublishTest(SyncCase):
@@ -69,7 +77,8 @@ class PublishTest(SyncCase):
         before = dict(self.aptly.pub)
         self.run_sync()
         self.assertEqual(self.aptly.pub, before)
-        self.assertEqual(len(self.aptly.snaps), 2)
+        self.assertEqual(len(self.snapshots_of("caddy")) + len(self.snapshots_of("ppa-moz")), 2)
+        self.assert_sources_paired()
 
     def test_changed_upstream_switches_and_trims(self) -> None:
         """A change is switched in; only keep_snapshots snapshots remain."""
@@ -81,6 +90,28 @@ class PublishTest(SyncCase):
         self.assertEqual(len(caddy_snaps), 2)  # keep_snapshots = 2
         self.assertEqual(self.published(CADDY), caddy_snaps[-1])
         self.assertEqual(self.aptly.snaps[caddy_snaps[-1]], 4)
+        self.assert_sources_paired()
+
+    def test_published_snapshot_has_latest_versions_only(self) -> None:
+        """Each run publishes a -latest merge of a full source snapshot kept beside it."""
+        self.run_sync()
+        latest = [c for c in self.aptly.calls if c[0] == "latest"]
+        self.assertEqual(len(latest), 2)
+        self.assertEqual({c[2] for c in latest}, {c[1] + "-src" for c in latest})
+        self.assertEqual(
+            self.published(CADDY), next(c[1] for c in latest if c[1].startswith("caddy-"))
+        )
+        for merged in (c[1] for c in latest):
+            self.assertIn(merged + "-src", self.aptly.snaps)
+
+    def test_leftover_source_snapshot_is_dropped(self) -> None:
+        """A source snapshot without its merged one (interrupted run) is removed."""
+        self.run_sync()
+        self.aptly.mirror["caddy"].content = 1
+        self.aptly.snaps["caddy-20260101T000000Z-src"] = 1
+        self.run_sync()
+        self.assertNotIn("caddy-20260101T000000Z-src", self.aptly.snaps)
+        self.assert_sources_paired()
 
     def test_two_runs_in_one_second(self) -> None:
         """Snapshot names stay unique within one second."""
@@ -182,7 +213,7 @@ class ChangeTest(SyncCase):
         self.assertNotIn("ppa-moz", state.mirrors)
         self.assertNotIn(MOZ, self.aptly.pub)
         self.assertNotIn("ppa-moz", self.aptly.mirrors())
-        self.assertEqual(self.snapshots_of("ppa-moz"), [])
+        self.assertFalse([s for s in self.aptly.snaps if s.startswith("ppa-moz-")])
 
     def test_rename_with_dead_upstream_keeps_prefix_served(self) -> None:
         """A renamed mirror whose upstream is down keeps the old content served."""
@@ -196,7 +227,7 @@ class ChangeTest(SyncCase):
         del self.aptly.fail["mozilla"]
         self.run_sync(cfg)
         self.assertTrue(self.published(MOZ).startswith("mozilla-"))
-        self.assertEqual(self.snapshots_of("ppa-moz"), [])
+        self.assertFalse([s for s in self.aptly.snaps if s.startswith("ppa-moz-")])
         self.assertNotIn("ppa-moz", self.aptly.mirrors())
 
 
@@ -231,6 +262,18 @@ class StateTest(SyncCase):
             sync_mod.run_lock(self.root),
         ):
             pass
+
+
+class SnapshotNameTest(unittest.TestCase):
+    """Snapshot names tie snapshots to their mirror."""
+
+    def test_owner_and_source(self) -> None:
+        """Owner is parsed from published and source snapshots; foreign names have none."""
+        self.assertEqual(snapshot_owner("ppa-moz-20261116T120000Z"), "ppa-moz")
+        self.assertEqual(snapshot_owner("ppa-moz-20261116T120000Z-2-src"), "ppa-moz")
+        self.assertTrue(is_source_snapshot("caddy-20261116T120000Z-src"))
+        self.assertFalse(is_source_snapshot("caddy-20261116T120000Z-2"))
+        self.assertIsNone(snapshot_owner("manual-snapshot"))
 
 
 class DearmorTest(unittest.TestCase):
