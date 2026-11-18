@@ -104,9 +104,11 @@ upstream is thus asked no more often than before, while a failed one is
 retried at the next run: a PPA that comes back after a Launchpad outage is
 mirrored within minutes, not hours. `sync --all` syncs every mirror now. Before
 aptly starts, the upstream's `dists/<distribution>/InRelease` is probed with
-one `HEAD` (`probe_timeout_seconds`, default 10); a mirror whose upstream gives
-no HTTP answer is recorded as failed (`upstream unreachable`) without waiting
-for aptly's retries, so a run during an outage takes seconds. Any HTTP answer
+one `HEAD` (`probe_timeout_seconds`, default 10, one deadline for all the
+host's addresses); a mirror whose upstream gives no HTTP answer is recorded as
+failed (`upstream unreachable`) without waiting for aptly's retries. A host
+that did not answer is not probed again in the same run (all PPAs share
+Launchpad), so a run during an outage takes seconds. Any HTTP answer
 counts as reachable; what is wrong with it is reported by aptly. `aptly db
 cleanup` runs only when the run synced or removed something.
 

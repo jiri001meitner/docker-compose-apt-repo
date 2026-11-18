@@ -8,9 +8,10 @@ import threading
 import time
 import unittest
 from typing import Any, ClassVar, override
+from unittest import mock
 
 from repo_sync.config import Upstream
-from repo_sync.probe import UpstreamUnreachableError, probe, release_url
+from repo_sync.probe import UpstreamUnreachableError, probe, release_url, run_probe
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -90,6 +91,61 @@ class ProbeTest(unittest.TestCase):
             with self.assertRaises(UpstreamUnreachableError):
                 probe(upstream(sock.getsockname()[1]), 0.3)
             self.assertLess(time.monotonic() - started, 5)
+
+    def test_deadline_covers_all_addresses(self) -> None:
+        """Six silent addresses together take the timeout, not six times it."""
+
+        class Silent(socket.socket):
+            """A socket whose connect waits out its timeout."""
+
+            @override
+            def connect(self, address: Any) -> None:
+                time.sleep(self.gettimeout() or 0)
+                raise TimeoutError(f"timed out connecting to {address}")
+
+        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 80))] * 6
+        with (
+            mock.patch("socket.getaddrinfo", return_value=addresses),
+            mock.patch("socket.socket", Silent),
+        ):
+            started = time.monotonic()
+            with self.assertRaises(UpstreamUnreachableError):
+                probe(upstream(80), 0.3)
+            self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_refused_address_tries_next(self) -> None:
+        """A refused address does not end the probe; the next one answers."""
+        paths: list[str] = []
+        server = self.serve(200, paths)
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            dead = closed.getsockname()
+        addresses = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", dead),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", server.server_port)),
+        ]
+        with mock.patch("socket.getaddrinfo", return_value=addresses):
+            probe(upstream(server.server_port), 2)
+        self.assertEqual(len(paths), 1)
+
+    def test_run_probe_asks_dead_host_once(self) -> None:
+        """Mirrors on a host that failed in this run fail at once; others are probed."""
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            port = closed.getsockname()[1]
+        dead = upstream(port)
+        sibling = Upstream(f"http://127.0.0.1:{port}/other", "resolute", "main", ("amd64",))
+        paths: list[str] = []
+        live = upstream(self.serve(200, paths).server_port)
+        run = run_probe()
+        with mock.patch("repo_sync.probe.probe", side_effect=probe) as real:
+            for up in (dead, sibling):
+                with self.subTest(up.url), self.assertRaises(UpstreamUnreachableError) as ctx:
+                    run(up, 2)
+                self.assertIn(up.url.rstrip("/"), str(ctx.exception))
+            run(live, 2)
+        self.assertEqual([c.args[0] for c in real.call_args_list], [dead, live])
+        self.assertEqual(len(paths), 1)
 
 
 if __name__ == "__main__":

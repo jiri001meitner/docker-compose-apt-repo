@@ -28,7 +28,7 @@ from .aptly import Aptly, AptlySettings
 from .catalog import UNKNOWN, render_index, render_status, report
 from .config import Config, ConfigError, load_config
 from .gpg import export_public_key, signing_keyring
-from .probe import probe
+from .probe import run_probe
 from .sync import STATE_FILE, LockedError, RunOptions, State, Syncer, run_lock
 
 DEFAULT_CONFIG = "/etc/repo-sync/mirrors.json"
@@ -65,7 +65,7 @@ def sync(config: Config, root: Path, *, sync_all: bool) -> None:
             AptlySettings(root_dir=str(root), signing=config.signing),
             config_path=os.path.join(keyring_dir, "aptly.conf"),
         )
-        options = RunOptions(probe=probe, sync_all=sync_all)
+        options = RunOptions(probe=run_probe(), sync_all=sync_all)
         Syncer(config, aptly, root, Path(keyring_dir), options).run()
 
 
