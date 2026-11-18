@@ -14,8 +14,9 @@ from unittest import mock
 from repo_sync import gpg
 from repo_sync import sync as sync_mod
 from repo_sync.aptly import AptlyError, Publication, is_source_snapshot, snapshot_owner
-from repo_sync.config import parse_config
-from repo_sync.sync import STATE_FILE, State, Syncer
+from repo_sync.config import Upstream, parse_config
+from repo_sync.probe import UpstreamUnreachableError
+from repo_sync.sync import STATE_FILE, RunOptions, State, Syncer
 
 from .fake_aptly import FakeAptly, config_json
 from .tempdirs import temp_dir
@@ -36,13 +37,28 @@ class SyncCase(unittest.TestCase):
         self.enterContext(
             mock.patch.object(sync_mod, "dearmor", side_effect=lambda f, d: f + ".gpg")
         )
+        self.unreachable: set[str] = set()  # upstream URLs the probe finds dead
+        self.probed: list[str] = []
 
-    def run_sync(self, cfg: dict[str, Any] | None = None, advance: bool = True) -> State:
-        """One run, by default 6 hours after the previous one."""
-        if advance:
-            self.clock += timedelta(hours=6)
+    def probe(self, upstream: Upstream, timeout: float) -> None:
+        """Fake reachability check of an upstream."""
+        self.assertGreater(timeout, 0)
+        self.probed.append(upstream.url)
+        if upstream.url in self.unreachable:
+            raise UpstreamUnreachableError(f"upstream unreachable ({upstream.url}): timed out")
+
+    def run_sync(
+        self,
+        cfg: dict[str, Any] | None = None,
+        advance: timedelta = timedelta(hours=6),
+        *,
+        sync_all: bool = False,
+    ) -> State:
+        """One run, by default 6 hours (sync_interval_hours) after the previous one."""
+        self.clock += advance
         config = parse_config(json.dumps(cfg or config_json()))
-        return Syncer(config, self.aptly, self.root, self.root).run()
+        options = RunOptions(probe=self.probe, sync_all=sync_all)
+        return Syncer(config, self.aptly, self.root, self.root, options).run()
 
     def published(self, target: tuple[str, str]) -> str:
         """The snapshot published at (prefix, distribution)."""
@@ -117,9 +133,9 @@ class PublishTest(SyncCase):
         """Snapshot names stay unique within one second."""
         self.run_sync()
         self.aptly.upstream["caddy"] = 2
-        self.run_sync(advance=False)
+        self.run_sync(advance=timedelta(0), sync_all=True)
         self.aptly.upstream["caddy"] = 3
-        state = self.run_sync(advance=False)
+        state = self.run_sync(advance=timedelta(0), sync_all=True)
         self.assertIsNone(state.mirrors["caddy"].last_error)
         self.assertTrue(self.published(CADDY).endswith("-2"))
 
@@ -163,6 +179,90 @@ class FailureTest(SyncCase):
         state = self.run_sync(cfg)
         self.assertIsNone(state.mirrors["caddy"].last_error)
         self.assertEqual(self.aptly.snaps[self.published(CADDY)], 2)
+
+
+class ScheduleTest(SyncCase):
+    """Frequent runs sync only due mirrors; a dead upstream is skipped quickly."""
+
+    QUARTER = timedelta(minutes=15)
+
+    def updates(self) -> list[str]:
+        """Mirrors whose snapshot was taken (one per sync), in order."""
+        return [str(snapshot_owner(c[1])) for c in self.aptly.calls if c[0] == "latest"]
+
+    def test_fresh_mirror_waits_for_interval(self) -> None:
+        """A healthy mirror is not synced again before sync_interval_hours."""
+        self.run_sync()
+        self.aptly.calls.clear()
+        self.probed.clear()
+        self.run_sync(advance=self.QUARTER)
+        self.assertEqual(self.updates(), [])
+        self.assertEqual(self.probed, [])
+        self.run_sync(advance=timedelta(hours=6) - self.QUARTER)
+        self.assertEqual(sorted(self.updates()), ["caddy", "ppa-moz"])
+
+    def test_failed_mirror_is_retried_next_run(self) -> None:
+        """An upstream that came back is synced at the next run, not after hours."""
+        self.unreachable.add("https://up.test/moz")
+        state = self.run_sync()
+        self.assertIn("unreachable", state.mirrors["ppa-moz"].last_error or "")
+        self.assertNotIn(MOZ, self.aptly.pub)
+        self.unreachable.clear()
+        self.aptly.calls.clear()
+        state = self.run_sync(advance=self.QUARTER)
+        self.assertEqual(self.updates(), ["ppa-moz"])
+        self.assertIn(MOZ, self.aptly.pub)
+        self.assertIsNone(state.mirrors["ppa-moz"].last_error)
+
+    def test_unreachable_upstream_skips_aptly(self) -> None:
+        """A dead upstream does not start aptly; the other mirrors continue."""
+        self.unreachable.add("https://up.test/moz")
+        state = self.run_sync()
+        self.assertNotIn("ppa-moz", self.aptly.mirrors())
+        self.assertFalse([c for c in self.aptly.calls if "ppa-moz" in str(c)])
+        self.assertIsNone(state.mirrors["caddy"].last_error)
+        self.assertIn(CADDY, self.aptly.pub)
+
+    def test_changed_definition_is_due(self) -> None:
+        """A changed mirror definition is synced at once, not after the interval."""
+        self.run_sync()
+        cfg = config_json()
+        cfg["mirrors"][0]["url"] = "https://up.test/caddy2"
+        self.aptly.calls.clear()
+        self.run_sync(cfg, advance=self.QUARTER)
+        self.assertEqual(self.updates(), ["caddy"])
+
+    def test_lost_publication_is_due(self) -> None:
+        """A mirror whose publication disappeared is published again at once."""
+        self.run_sync()
+        del self.aptly.pub[CADDY]
+        self.run_sync(advance=self.QUARTER)
+        self.assertIn(CADDY, self.aptly.pub)
+
+    def test_sync_all_ignores_interval(self) -> None:
+        """--all syncs every mirror even when none is due."""
+        self.run_sync()
+        self.aptly.calls.clear()
+        self.run_sync(advance=self.QUARTER, sync_all=True)
+        self.assertEqual(sorted(self.updates()), ["caddy", "ppa-moz"])
+
+    def test_idle_run_skips_db_cleanup(self) -> None:
+        """A run that synced nothing does not walk the package pool."""
+        self.run_sync()
+        with mock.patch.object(self.aptly, "db_cleanup") as cleanup:
+            self.run_sync(advance=self.QUARTER)
+            cleanup.assert_not_called()
+            self.run_sync(advance=timedelta(hours=6))
+            cleanup.assert_called_once()
+
+    def test_removed_mirror_pruned_on_idle_run(self) -> None:
+        """Removing a mirror takes effect even when no other mirror is due."""
+        self.run_sync()
+        cfg = config_json()
+        cfg["mirrors"] = cfg["mirrors"][:1]
+        state = self.run_sync(cfg, advance=self.QUARTER)
+        self.assertNotIn("ppa-moz", state.mirrors)
+        self.assertNotIn(MOZ, self.aptly.pub)
 
 
 class ChangeTest(SyncCase):

@@ -2,7 +2,10 @@
 
 Every mirror is independent: a failing upstream (Launchpad down, Cloudsmith
 returning 402, a bad signature, a timeout) leaves its last published snapshot
-in place and the others continue. Decisions are taken from what aptly really
+in place and the others continue. Runs are frequent; a mirror is synced only
+when it is due (``sync_interval_hours`` since its last success, or it failed,
+changed or is not published), so a failed one is retried at the next run
+while healthy upstreams are not asked more often. Decisions are taken from what aptly really
 has (``publish list -json``, ``snapshot list``), not from the state file; the
 state file only records results for the catalogue and the report, so a crash
 anywhere in a run heals on the next one.
@@ -15,16 +18,17 @@ import dataclasses
 import json
 import logging
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 from repo_common.fsio import atomic_write, exclusive_lock
-from repo_common.timeutil import format_utc, utcnow
+from repo_common.timeutil import format_utc, parse_optional_utc, utcnow
 
 from .aptly import SOURCE_SUFFIX, AptlyError, Publication, is_source_snapshot, snapshot_owner
-from .config import Config, Mirror
+from .config import Config, Mirror, Upstream
 from .gpg import dearmor
 
 log = logging.getLogger(__name__)
@@ -38,6 +42,8 @@ MAX_ERROR_LENGTH = 500
 SYNC_ERRORS = (AptlyError, subprocess.SubprocessError, OSError, ValueError)
 
 type Publications = dict[tuple[str, str], Publication]
+# Raises (an OSError) when the upstream does not answer within the timeout.
+type Probe = Callable[[Upstream, float], None]
 
 
 class LockedError(RuntimeError):
@@ -91,6 +97,14 @@ class AptlyOps(Protocol):
 
     def db_cleanup(self) -> None:
         """Remove unreferenced package files."""
+
+
+@dataclass(frozen=True, slots=True)
+class RunOptions:
+    """How one run picks and checks its mirrors."""
+
+    probe: Probe
+    sync_all: bool = False  # ignore sync_interval_hours (manual run)
 
 
 @dataclass
@@ -179,24 +193,33 @@ def _short_error(exc: BaseException) -> str:
 class Syncer:
     """Runs one synchronisation of all configured mirrors."""
 
-    def __init__(self, config: Config, aptly: AptlyOps, root: Path, keyring_dir: Path) -> None:
+    def __init__(
+        self, config: Config, aptly: AptlyOps, root: Path, keyring_dir: Path, options: RunOptions
+    ) -> None:
         self.config = config
         self.aptly = aptly
+        self.options = options
         self.keyring_dir = keyring_dir
         self.state_path = root / STATE_FILE
         self.state = State.load(self.state_path)
         self.started = utcnow()  # one timestamp for the whole run
 
     def run(self) -> State:
-        """Sync every mirror, then clean up; returns the new state."""
+        """Sync every due mirror, then clean up; returns the new state."""
         now = self.started
         mirrors = self.aptly.mirrors()
         pubs = self.aptly.publications()
+        attempted = False
         for mirror in self.config.mirrors:
             st = self.state.mirrors.setdefault(mirror.name, MirrorState())
+            if not (self.options.sync_all or self._due(mirror, st, mirrors, pubs)):
+                log.debug("mirror %s: synced at %s, not due yet", mirror.name, st.last_success)
+                continue
+            attempted = True
             st.first_attempt = st.first_attempt or format_utc(now)
             st.last_attempt = format_utc(now)
             try:
+                self.options.probe(mirror.upstream, self.config.schedule.probe_timeout_seconds)
                 self._sync_one(mirror, st, mirrors, pubs)
                 st.last_success = format_utc(now)
                 st.last_error = None
@@ -204,19 +227,41 @@ class Syncer:
                 st.last_error = _short_error(exc)
                 log.error("mirror %s: %s", mirror.name, st.last_error)
             self.state.save(self.state_path)
-        self.cleanup(pubs)
+        self.cleanup(pubs, db=attempted)
         self.state.last_run = format_utc(utcnow())
         self.state.save(self.state_path)
         return self.state
 
-    def cleanup(self, pubs: Publications) -> None:
+    def _due(self, mirror: Mirror, st: MirrorState, mirrors: set[str], pubs: Publications) -> bool:
+        """True when the mirror has to be synced in this run.
+
+        A healthy, published mirror waits ``sync_interval_hours`` after its
+        last success; anything else (never synced, last attempt failed,
+        definition changed, publication missing or someone else's) is due now.
+        """
+        success = parse_optional_utc(st.last_success)
+        current = pubs.get(mirror.target)
+        return (
+            success is None
+            or st.last_error is not None
+            or st.mirror_hash != mirror.upstream.identity()
+            or mirror.name not in mirrors
+            or current is None
+            or snapshot_owner(current.snapshot) != mirror.name
+            or self.started - success >= timedelta(hours=self.config.schedule.sync_interval_hours)
+        )
+
+    def cleanup(self, pubs: Publications, *, db: bool = True) -> None:
         """Drop what removed mirrors left behind, then unreferenced package files.
 
         Runs after the configured mirrors had their chance: a renamed mirror
         first takes over its prefix, and only then is the old one dropped
-        (never leaving the prefix empty meanwhile).
+        (never leaving the prefix empty meanwhile). ``aptly db cleanup``
+        walks the whole pool, so it runs only when this run changed something.
         """
-        self._prune_removed(pubs)
+        pruned = self._prune_removed(pubs)
+        if not (db or pruned):
+            return
         try:
             self.aptly.db_cleanup()
         except SYNC_ERRORS as exc:
@@ -334,8 +379,8 @@ class Syncer:
         for snap in others[self.config.keep_snapshots - 1 :]:
             self._drop_with_source(snap)
 
-    def _prune_removed(self, pubs: Publications) -> None:
-        """Drop what belongs to mirrors no longer in the config.
+    def _prune_removed(self, pubs: Publications) -> bool:
+        """Drop what belongs to mirrors no longer in the config; True if anything was.
 
         Works from aptly's real content. A publication of a removed mirror at
         a place a configured mirror owns is kept until that mirror publishes
@@ -347,7 +392,11 @@ class Syncer:
             mirrors = self.aptly.mirrors()
         except SYNC_ERRORS as exc:
             log.error("cleanup of removed mirrors skipped: %s", _short_error(exc))
-            return
+            return False
+        leftovers = any(
+            (owner := snapshot_owner(snap)) is not None and owner not in wanted
+            for snap in snapshots
+        )
         targets = {m.target for m in self.config.mirrors}
         for snap in snapshots:
             owner = snapshot_owner(snap)
@@ -364,6 +413,7 @@ class Syncer:
                 log.error("cleanup of mirror %s failed: %s", name, _short_error(exc))
         for name in sorted(set(self.state.mirrors) - wanted):
             del self.state.mirrors[name]
+        return leftovers or bool(mirrors - wanted)
 
     def _prune_snapshot(self, snap: str, pubs: Publications, targets: set[tuple[str, str]]) -> None:
         """Drop a removed mirror's snapshot and its publications, unless still needed."""

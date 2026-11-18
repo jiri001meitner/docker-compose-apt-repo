@@ -163,10 +163,24 @@ grep -q '^Acquire-By-Hash: yes' "${pub}/ppa/fixture/dists/resolute/Release" || f
 [[ -d "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/by-hash" ]] || fail "no by-hash directory"
 pass "indexes published by hash"
 
-# --- run 2: unchanged upstream ---------------------------------------------
+# --- run 1b: frequent runs sync only due mirrors -----------------------------
+# The fixture synced moments ago (not due before sync_interval_hours); the
+# dead mirror failed, so it is retried, and the probe gives up quickly.
 before="$(sha256sum "${pub}/ppa/fixture/dists/resolute/InRelease")"
 sleep 1
-repo_sync sync 2>"${work}/sync2.log" || fail "sync 2 exit code"
+started=${SECONDS}
+repo_sync sync 2>"${work}/sync1b.log" || fail "sync 1b exit code"
+grep -q 'mirror fixture:' "${work}/sync1b.log" && { cat "${work}/sync1b.log"; fail "fresh mirror synced again"; }
+[[ "$(sha256sum "${pub}/ppa/fixture/dists/resolute/InRelease")" == "${before}" ]] || fail "fresh mirror republished"
+grep -q 'mirror dead: upstream unreachable' "${work}/sync1b.log" || { cat "${work}/sync1b.log"; fail "dead mirror not retried"; }
+(( SECONDS - started < 30 )) || fail "run with a dead upstream took $(( SECONDS - started )) s"
+pass "fresh mirror skipped, failed one retried, dead upstream skipped quickly"
+
+# Runs 2-4 change only the upstream, not the configuration: --all syncs a
+# mirror that is not due yet (manual run).
+# --- run 2: unchanged upstream ---------------------------------------------
+sleep 1
+repo_sync sync --all 2>"${work}/sync2.log" || fail "sync 2 exit code"
 grep -q 'mirror fixture: no change' "${work}/sync2.log" || fail "expected no change"
 [[ "$(sha256sum "${pub}/ppa/fixture/dists/resolute/InRelease")" == "${before}" ]] || fail "republished unchanged"
 pass "unchanged upstream is not republished"
@@ -175,7 +189,7 @@ pass "unchanged upstream is not republished"
 mkpkg hello 1.1 amd64
 publish_upstream
 sleep 1
-repo_sync sync 2>"${work}/sync3.log" || fail "sync 3 exit code"
+repo_sync sync --all 2>"${work}/sync3.log" || fail "sync 3 exit code"
 grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "1.1 not published"
 pass "new upstream version switched in"
 grep -q '/hello_1.0_amd64.deb$' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" \
@@ -186,13 +200,14 @@ pass "only the latest version is published"
 # --- run 4: upstream breaks (bad signature) keeps last good ------------------
 echo tampered >> "${up}/dists/resolute/Release"
 sleep 1
-repo_sync sync 2>"${work}/sync4.log" || fail "sync 4 exit code"
+repo_sync sync --all 2>"${work}/sync4.log" || fail "sync 4 exit code"
 grep -q 'mirror fixture:' "${work}/sync4.log" || fail "no error logged for tampered upstream"
 grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "last good lost"
 pass "tampered upstream rejected, last good snapshot still served"
 publish_upstream
 
 # --- run 5: architectures added -------------------------------------------------
+# Runs 5-7 change the configuration, which makes the mirror due without --all.
 set_mirror 'm["architectures"] = ["amd64", "i386"]'
 sleep 1
 repo_sync sync 2>"${work}/sync5.log" || fail "sync 5 exit code"

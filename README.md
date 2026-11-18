@@ -95,7 +95,22 @@ upstream public keys (armored) are in `config/keys/`. The repository signing
 key must have no passphrase (it is imported with `--batch`). Decisions are
 taken from aptly's real state (`publish list -json`), the state file only
 feeds the catalogue and the report, so an interrupted run heals on the next.
-One run:
+
+Runs are meant to be frequent (the linuxadm timer: every 15 minutes). A
+mirror is synced only when it is **due**: `sync_interval_hours` (default 6)
+after its last success, or at once when its last attempt failed, it never
+synced, its definition changed or its publication is missing. A healthy
+upstream is thus asked no more often than before, while a failed one is
+retried at the next run: a PPA that comes back after a Launchpad outage is
+mirrored within minutes, not hours. `sync --all` syncs every mirror now. Before
+aptly starts, the upstream's `dists/<distribution>/InRelease` is probed with
+one `HEAD` (`probe_timeout_seconds`, default 10); a mirror whose upstream gives
+no HTTP answer is recorded as failed (`upstream unreachable`) without waiting
+for aptly's retries, so a run during an outage takes seconds. Any HTTP answer
+counts as reachable; what is wrong with it is reported by aptly. `aptly db
+cleanup` runs only when the run synced or removed something.
+
+For each due mirror:
 
 1. `aptly mirror update`, verifying the upstream signature with the mirror's
    key only (a tampered upstream is rejected);
@@ -133,7 +148,8 @@ Clients with a foreign architecture (`i386`) must set `Architectures: amd64`
 in their source.
 
 ```bash
-docker compose run --rm repo-sync            # sync + catalogue
+docker compose run --rm repo-sync            # sync of due mirrors + catalogue
+docker compose run --rm repo-sync sync --all # every mirror now (manual run)
 docker compose run --rm repo-sync catalog    # catalogue only, no network
 docker compose run --rm repo-sync report     # "<status>\t<text>|<perfdata>" for Icinga
 ```
@@ -157,8 +173,9 @@ internal error, 75 another run holds the lock.
 5. Caddy site block from `caddy/repo.caddy.example`: catalogue served from
    `aptly/site` without auth, everything else through `forward_auth` from
    `aptly/public` (no `browse`).
-6. Timer running `docker compose run --rm repo-sync`; the firewall must allow
-   outbound traffic from `br-aptrepo`.
+6. Timer running `docker compose run --rm repo-sync` frequently (e.g. every
+   15 minutes, see above); the firewall must allow outbound traffic from
+   `br-aptrepo`.
 
 In the linuxadm repository this is done by the Ansible role `apt_repo`.
 

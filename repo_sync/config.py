@@ -38,6 +38,8 @@ CONFIG_KEYS = frozenset(
         "keep_snapshots",
         "stale_warning_hours",
         "stale_critical_hours",
+        "sync_interval_hours",
+        "probe_timeout_seconds",
         "site_title",
         "base_url",
         "mirrors",
@@ -104,13 +106,22 @@ class Signing:
 
 
 @dataclass(frozen=True, slots=True)
+class Schedule:
+    """When a mirror is synced, how long its upstream may take to answer, when it is stale."""
+
+    sync_interval_hours: int
+    probe_timeout_seconds: int
+    stale_warning_hours: int
+    stale_critical_hours: int
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """The whole ``mirrors.json``."""
 
     signing: Signing
     keep_snapshots: int
-    stale_warning_hours: int
-    stale_critical_hours: int
+    schedule: Schedule
     site_title: str
     base_url: str
     mirrors: tuple[Mirror, ...]
@@ -235,8 +246,12 @@ def parse_config(data: str) -> Config:
             label=_str(raw, "label", "config"),
         ),
         keep_snapshots=_int(raw, "keep_snapshots", 3, 1),
-        stale_warning_hours=warn,
-        stale_critical_hours=crit,
+        schedule=Schedule(
+            sync_interval_hours=_int(raw, "sync_interval_hours", 6, 1),
+            probe_timeout_seconds=_int(raw, "probe_timeout_seconds", 10, 1),
+            stale_warning_hours=warn,
+            stale_critical_hours=crit,
+        ),
         site_title=_str(raw, "site_title", "config"),
         base_url=base_url,
         mirrors=mirrors,

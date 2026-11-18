@@ -1,6 +1,7 @@
 """repo-sync CLI.
 
-  repo-sync sync      update mirrors, publish, rebuild the catalogue
+  repo-sync sync      update due mirrors, publish, rebuild the catalogue
+                      (--all: every mirror, regardless of sync_interval_hours)
   repo-sync catalog   rebuild only the catalogue (no network)
   repo-sync report    print "<status>\\t<output>|<perfdata>" for Icinga
 
@@ -27,7 +28,8 @@ from .aptly import Aptly, AptlySettings
 from .catalog import UNKNOWN, render_index, render_status, report
 from .config import Config, ConfigError, load_config
 from .gpg import export_public_key, signing_keyring
-from .sync import STATE_FILE, LockedError, State, Syncer, run_lock
+from .probe import probe
+from .sync import STATE_FILE, LockedError, RunOptions, State, Syncer, run_lock
 
 DEFAULT_CONFIG = "/etc/repo-sync/mirrors.json"
 DEFAULT_ROOT = "/var/lib/aptly"
@@ -56,14 +58,15 @@ def write_catalog(config: Config, root: Path) -> None:
     atomic_write(site / "index.html", render_index(config, state, now, grouped))
 
 
-def sync(config: Config, root: Path) -> None:
-    """Synchronise all mirrors with a throw-away keyring and aptly config."""
+def sync(config: Config, root: Path, *, sync_all: bool) -> None:
+    """Synchronise due mirrors (all with ``sync_all``), throw-away keyring and aptly config."""
     with tempfile.TemporaryDirectory(prefix="repo-sync-keys-") as keyring_dir:
         aptly = Aptly(
             AptlySettings(root_dir=str(root), signing=config.signing),
             config_path=os.path.join(keyring_dir, "aptly.conf"),
         )
-        Syncer(config, aptly, root, Path(keyring_dir)).run()
+        options = RunOptions(probe=probe, sync_all=sync_all)
+        Syncer(config, aptly, root, Path(keyring_dir), options).run()
 
 
 def print_report(config: Config, root: Path) -> int:
@@ -77,7 +80,7 @@ def print_report(config: Config, root: Path) -> int:
     return 0
 
 
-def update(command: str, config: Config, root: Path) -> int:
+def update(command: str, config: Config, root: Path, *, sync_all: bool = False) -> int:
     """``sync`` or ``catalog``: change the published tree under the run lock."""
     # docker stop sends SIGTERM to PID 1: unwind so the lock is released, the
     # temporary GNUPGHOME removed and the running aptly child killed.
@@ -86,7 +89,7 @@ def update(command: str, config: Config, root: Path) -> int:
     try:
         with run_lock(root), signing_keyring(os.environ.get("REPO_SYNC_SIGNING_KEY")):
             if command == "sync":
-                sync(config, root)
+                sync(config, root, sync_all=sync_all)
             write_catalog(config, root)
     except LockedError as exc:
         log.error("%s", exc)
@@ -106,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=["sync", "catalog", "report"])
     parser.add_argument("--config", default=os.environ.get("REPO_SYNC_CONFIG", DEFAULT_CONFIG))
     parser.add_argument("--root", default=os.environ.get("REPO_SYNC_ROOT", DEFAULT_ROOT))
+    parser.add_argument(
+        "--all",
+        dest="sync_all",
+        action="store_true",
+        help="sync: every mirror now, not only the due ones",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -121,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root)
     if args.command == "report":
         return print_report(config, root)
-    return update(args.command, config, root)
+    return update(args.command, config, root, sync_all=args.sync_all)
 
 
 def _terminate(signum: int, _frame: FrameType | None) -> None:

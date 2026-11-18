@@ -77,9 +77,9 @@ def assess(config: Config, state: State, now: datetime) -> list[MirrorHealth]:
         st = state.mirrors.get(mirror.name, MirrorState())
         success = parse_optional_utc(st.last_success)
         age = _hours(now, success or parse_optional_utc(st.first_attempt)) or 0.0
-        if age >= config.stale_critical_hours:
+        if age >= config.schedule.stale_critical_hours:
             level = CRITICAL
-        elif success is None or age >= config.stale_warning_hours:
+        elif success is None or age >= config.schedule.stale_warning_hours:
             level = WARNING
         else:
             level = OK

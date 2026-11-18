@@ -34,6 +34,19 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.mirrors[1].upstream.component, "main")
         self.assertEqual(config.signing.gpg_key, "A" * 40)
 
+    def test_schedule_defaults(self) -> None:
+        """Without the keys a mirror is synced every 6 h, the probe waits 10 s."""
+        config = parse_config(json.dumps(config_json()))
+        self.assertEqual(
+            (config.schedule.sync_interval_hours, config.schedule.probe_timeout_seconds), (6, 10)
+        )
+        custom = parse_config(
+            json.dumps(config_json(sync_interval_hours=12, probe_timeout_seconds=5))
+        )
+        self.assertEqual(
+            (custom.schedule.sync_interval_hours, custom.schedule.probe_timeout_seconds), (12, 5)
+        )
+
     def test_identity_follows_upstream(self) -> None:
         """Only upstream fields change the mirror identity (recreate), not the prefix."""
         base = parse_config(json.dumps(config_json())).mirrors[0]
@@ -67,6 +80,9 @@ class ConfigTest(unittest.TestCase):
             "keep 0": mutate(lambda c: c.update(keep_snapshots=0)),
             "base url slash": mutate(lambda c: c.update(base_url="https://repo.test/")),
             "bool as int": mutate(lambda c: c.update(keep_snapshots=True)),
+            "interval 0": mutate(lambda c: c.update(sync_interval_hours=0)),
+            "probe timeout 0": mutate(lambda c: c.update(probe_timeout_seconds=0)),
+            "probe timeout float": mutate(lambda c: c.update(probe_timeout_seconds=2.5)),
         }
         for name, data in cases.items():
             with self.subTest(name), self.assertRaises(ConfigError):

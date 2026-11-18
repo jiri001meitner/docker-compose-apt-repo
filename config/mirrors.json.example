@@ -5,6 +5,8 @@
   "keep_snapshots": 3,
   "stale_warning_hours": 48,
   "stale_critical_hours": 168,
+  "sync_interval_hours": 6,
+  "probe_timeout_seconds": 10,
   "site_title": "APT mirrors",
   "base_url": "https://repo.example.org",
   "mirrors": [
