@@ -26,7 +26,7 @@ commands are in [README.md](README.md); rules for contributors in
 |---|---|---|
 | `repo_common/` | both | UTC timestamps, atomic writes and locks, the single program runner |
 | `repo_auth/` | `repo-auth` | `model` (export format), `auth` (pure decision), `store` (reload), `server` (HTTP on the socket), `accounts` (SQLite), `admin` (CLI), `healthcheck` |
-| `repo_sync/` | `aptly` | `config` (mirrors.json), `aptly` (CLI wrapper), `gpg`, `sync` (one run), `catalog` (status, index, Icinga report), `__main__` (CLI) |
+| `repo_sync/` | `aptly` | `config` (mirrors.json), `aptly` (CLI wrapper), `gpg`, `gpgv` (apt's signature rule for aptly, `/usr/local/bin/gpgv`), `sync` (one run), `catalog` (status, index, Icinga report), `__main__` (CLI) |
 
 ## Data and state
 
@@ -61,7 +61,13 @@ feeds the catalogue, so a lost or stale state file heals on the next run.
    bypassed through the file system.
 4. **repo-sync → upstreams.** Each mirror is verified with its own upstream
    key only; a tampered upstream is rejected and the last good snapshot
-   stays published. The only container with network access, in its own
+   stays published. aptly fails on any signature it cannot check, so the
+   `gpgv` it runs applies apt's rule instead: at least one `VALIDSIG` by the
+   mirror's key, every other signature only `NO_PUBKEY` and nothing else in
+   the status (an `ERROR`, e.g. a second clearsigned message appended to
+   the file, or any unknown keyword fails closed). Trusting
+   Launchpad's legacy 1024-bit PPA keys instead would let a Release signed
+   by such a key alone through. The only container with network access, in its own
    bridge `br-aptrepo`.
 5. **Signing key.** Imported per run into a throw-away GNUPGHOME; nothing
    derived from it outlives the process.

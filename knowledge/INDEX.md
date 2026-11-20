@@ -11,3 +11,4 @@ trefené soubory. Postupy patří do `skills/`.
 | [gpg-dearmor-binarni-vstup.md](gpg-dearmor-binarni-vstup.md) | `gpg --dearmor` na binárním klíči uspěje a zapíše nesmysl |
 | [caddy-cesta-forward-auth.md](caddy-cesta-forward-auth.md) | Caddy čistí cestu před forward_auth, `%zz` a `%2F` |
 | [aptly-jen-posledni-verze.md](aptly-jen-posledni-verze.md) | publikuje se jen nejnovější verze (`snapshot merge -latest`), zdrojový snapshot musí žít se sloučeným |
+| [launchpad-dvoji-podpis-aptly-gpgv.md](launchpad-dvoji-podpis-aptly-gpgv.md) | PPA podepsané aktuálním i starým 1024bitovým klíčem; aptly chce ověřit všechny podpisy, proto vlastní `gpgv` s pravidlem apt |

@@ -43,8 +43,10 @@ mkpkg() {
    dpkg-deb -b "${dir}" "${up}/pool/${name}_${version}_${arch}.deb" >/dev/null
 }
 
-publish_upstream() {
-   local d="${up}/dists/resolute" arch
+publish_upstream() {  # publish_upstream [signing key fingerprint...] (default: the upstream key)
+   local d="${up}/dists/resolute" arch signer
+   local -a signers=()
+   for signer in "$@"; do signers+=(--local-user "${signer}"); done
    rm -rf "${d}"
    for arch in amd64 i386; do
       mkdir -p "${d}/main/binary-${arch}"
@@ -54,7 +56,7 @@ publish_upstream() {
       -o APT::FTPArchive::Release::Architectures='amd64 i386' -o APT::FTPArchive::Release::Components=main \
       release "${d}" > "${work}/Release"
    mv "${work}/Release" "${d}/Release"
-   GNUPGHOME="${upstream_home}" gpg --batch -q --yes --clearsign -o "${d}/InRelease" "${d}/Release"
+   GNUPGHOME="${upstream_home}" gpg --batch -q --yes "${signers[@]}" --clearsign -o "${d}/InRelease" "${d}/Release"
 }
 
 mkpkg hello 1.0 amd64
@@ -204,6 +206,43 @@ repo_sync sync --all 2>"${work}/sync4.log" || fail "sync 4 exit code"
 grep -q 'mirror fixture:' "${work}/sync4.log" || fail "no error logged for tampered upstream"
 grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "last good lost"
 pass "tampered upstream rejected, last good snapshot still served"
+
+# --- run 4b/4c: second signature by a key outside the keyring (Launchpad) ----
+# Launchpad signs a PPA's Release with the current key and a legacy key. apt
+# accepts one valid signature from the keyring; aptly's gpgv must too, but a
+# Release signed by the unknown key alone stays rejected (repo_sync/gpgv.py).
+upstream_gpg() { GNUPGHOME="${upstream_home}" gpg "$@"; }
+upstream_fpr="$(upstream_gpg --list-keys --with-colons 'up@test' | awk -F: '/^fpr/{print $10; exit}')"
+upstream_gpg --batch -q --passphrase '' --quick-gen-key 'Legacy <legacy@test>' ed25519 sign never 2>/dev/null
+legacy_fpr="$(upstream_gpg --list-keys --with-colons 'legacy@test' | awk -F: '/^fpr/{print $10; exit}')"
+publish_upstream "${upstream_fpr}" "${legacy_fpr}"
+[[ "$(LC_ALL=C upstream_gpg --verify "${up}/dists/resolute/InRelease" 2>&1 | grep -c 'Good signature')" == 2 ]] \
+   || fail "fixture InRelease is not signed by two keys"
+sleep 1
+repo_sync sync --all 2>"${work}/sync4b.log" || fail "sync 4b exit code"
+grep -q 'mirror fixture: no change' "${work}/sync4b.log" \
+   || { cat "${work}/sync4b.log"; fail "Release signed by a known and an unknown key rejected"; }
+python3 - "${site}/status.json" <<'PY' || fail "status after 4b"
+import json, sys
+s = {m["name"]: m for m in json.load(open(sys.argv[1]))["mirrors"]}
+assert not s["fixture"]["last_attempt_failed"], s["fixture"]
+PY
+pass "Release signed by the keyring key and an unknown key accepted"
+publish_upstream "${legacy_fpr}"
+sleep 1
+repo_sync sync --all 2>"${work}/sync4c.log" || fail "sync 4c exit code"
+grep -q 'mirror fixture: no change' "${work}/sync4c.log" && fail "Release signed only by an unknown key accepted"
+grep -q 'mirror fixture:' "${work}/sync4c.log" || fail "no error logged for unknown signer"
+grep -q 'Version: 1.1' "${pub}/ppa/fixture/dists/resolute/main/binary-amd64/Packages" || fail "last good lost"
+pass "Release signed only by an unknown key rejected"
+publish_upstream "${upstream_fpr}" "${legacy_fpr}"
+sed 's/^Suite: .*/Suite: evil/' "${up}/dists/resolute/Release" \
+   | upstream_gpg --batch -q --local-user "${legacy_fpr}" --clearsign >> "${up}/dists/resolute/InRelease"
+sleep 1
+repo_sync sync --all 2>"${work}/sync4d.log" || fail "sync 4d exit code"
+grep -q 'mirror fixture: no change' "${work}/sync4d.log" && fail "appended clearsigned message accepted"
+grep -q 'mirror fixture:' "${work}/sync4d.log" || fail "no error logged for appended message"
+pass "valid Release with an appended message by an unknown key rejected"
 publish_upstream
 
 # --- run 5: architectures added -------------------------------------------------

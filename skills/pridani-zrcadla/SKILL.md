@@ -7,7 +7,9 @@ description: Přidání, změna nebo odebrání zrcadleného APT repozitáře (P
 
 1. **Klíč upstreamu** získej z oficiálního zdroje (Launchpad API
    `signing_key_fingerprint`, dokumentace projektu) a ověř otisk proti
-   druhému zdroji. Ulož ho **armored** (`-----BEGIN PGP PUBLIC KEY BLOCK-----`,
+   druhému zdroji. U PPA stačí aktuální klíč z API; starý 1024bitový,
+   kterým Launchpad podepisuje navíc, do keyringu **nepatří**
+   (`knowledge/launchpad-dvoji-podpis-aptly-gpgv.md`). Ulož ho **armored** (`-----BEGIN PGP PUBLIC KEY BLOCK-----`,
    viz `knowledge/gpg-dearmor-binarni-vstup.md`). V produkci klíče spravuje
    role `apt_repo` v linuxadm (`roles/apt_repo/files/keys/`), sem se
    necommitují.

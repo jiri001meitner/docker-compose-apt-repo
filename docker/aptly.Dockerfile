@@ -18,8 +18,12 @@ RUN apt-get update \
 
 COPY repo_common/ /app/repo_common/
 COPY repo_sync/ /app/repo_sync/
+# aptly finds gpgv through PATH; this one accepts a Release that also carries
+# signatures by keys outside the keyring, as apt does (repo_sync/gpgv.py).
+COPY --chmod=0755 docker/gpgv.sh /usr/local/bin/gpgv
 RUN python3 -m compileall -q /app/repo_common /app/repo_sync \
-    && test -x /usr/bin/aptly && test -x /usr/bin/gpg && test -x /usr/bin/gpgconf
+    && test -x /usr/bin/aptly && test -x /usr/bin/gpg && test -x /usr/bin/gpgconf \
+    && test -x /usr/bin/gpgv && test "$(command -v gpgv)" = /usr/local/bin/gpgv
 
 USER 10200:10200
 ENTRYPOINT ["python3", "-m", "repo_sync"]

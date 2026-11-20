@@ -115,7 +115,11 @@ cleanup` runs only when the run synced or removed something.
 For each due mirror:
 
 1. `aptly mirror update`, verifying the upstream signature with the mirror's
-   key only (a tampered upstream is rejected);
+   key only (a tampered upstream is rejected). As in apt, one valid
+   signature by that key is enough when the Release also carries signatures
+   by keys outside the keyring (Launchpad PPAs add their legacy key); a
+   bad, expired or revoked signature, or only unknown signers, still fail
+   (`repo_sync/gpgv.py`, installed as the `gpgv` aptly runs);
 2. a full snapshot `<mirror>-<UTC timestamp>-src`, and from it (`snapshot
    merge -latest`) the snapshot `<mirror>-<UTC timestamp>` with **only the
    newest version of each package** — older versions lack security fixes.
